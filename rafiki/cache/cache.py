@@ -3,6 +3,8 @@ import os
 import json
 import uuid
 
+from rafiki.config import INFERENCE_WORKER_CACHE_DATABASE_NUMBER
+
 RUNNING_INFERENCE_WORKERS = 'INFERENCE_WORKERS'
 QUERIES_QUEUE = 'QUERIES'
 PREDICTIONS_QUEUE = 'PREDICTIONS'
@@ -10,11 +12,13 @@ PREDICTIONS_QUEUE = 'PREDICTIONS'
 class Cache(object):
     def __init__(self,
         host=os.environ.get('REDIS_HOST', 'localhost'),
-        port=os.environ.get('REDIS_PORT', 6379)):
+        port=os.environ.get('REDIS_PORT', 6379),
+        db=INFERENCE_WORKER_CACHE_DATABASE_NUMBER):
 
         cache_connection_url = self._make_connection_url(
             host=host,
-            port=port
+            port=port,
+            db=db
         )
 
         self._connection_pool = redis.ConnectionPool.from_url(cache_connection_url)
@@ -77,5 +81,5 @@ class Cache(object):
         # Return None if prediction is not found
         return None
 
-    def _make_connection_url(self, host, port):
-        return 'redis://{}:{}'.format(host, port)
+    def _make_connection_url(self, host, port, db):
+        return 'redis://{}:{}/{}'.format(host, port, db)

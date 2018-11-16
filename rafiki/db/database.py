@@ -6,7 +6,7 @@ import os
 from rafiki.constants import TrainJobStatus, \
     TrialStatus, ServiceStatus, InferenceJobStatus
 
-from .schema import Base, TrainJob, TrainJobWorker, \
+from .schema import Base, TrainJob, SubTrainJob, TrainJobWorker, \
     InferenceJob, Trial, Model, User, Service, InferenceJobWorker
 
 class Database(object):
@@ -52,7 +52,7 @@ class Database(object):
 
     def create_train_job(self, user_id, app, 
         app_version, task, train_dataset_uri, test_dataset_uri,
-        budget_type, budget_amount):
+        graph):
 
         train_job = TrainJob(
             user_id=user_id,
@@ -61,8 +61,7 @@ class Database(object):
             task=task,
             train_dataset_uri=train_dataset_uri,
             test_dataset_uri=test_dataset_uri,
-            budget_type=budget_type, 
-            budget_amount=budget_amount
+            graph=graph
         )
         self._session.add(train_job)
         return train_job
@@ -114,6 +113,23 @@ class Database(object):
         train_job.datetime_completed = datetime.datetime.utcnow()
         self._session.add(train_job)
         return train_job
+
+    ####################################
+    # Sub Train Job
+    ####################################   
+
+    def create_sub_train_job(self, train_job_id, model_id,
+        budget_type, budget_amount):
+        
+        sub_train_job = SubTrainJob(
+            train_job_id=train_job_id,
+            model_id=model_id,
+            budget_type=budget_type,
+            budget_amount=budget_amount
+        )
+
+        self._session.add(sub_train_job)
+        return sub_train_job
 
     ####################################
     # Train Job Workers
@@ -312,6 +328,22 @@ class Database(object):
 
     def get_models(self):
         return self._session.query(Model).all()
+
+    def get_selected_models_of_task(self, model_names, task):
+        models = self._session.query(Model) \
+            .filter(Model.task == task) \
+            .filter(Model.name.in_(model_names)) \
+            .all()
+
+        return models
+
+    def get_model_of_task(self, model_name, task):
+        model = self._session.query(Model) \
+            .filter(Model.task == task) \
+            .filter(Model.name == model_name) \
+            .first()
+
+        return model
 
     ####################################
     # Trials

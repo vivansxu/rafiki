@@ -142,13 +142,45 @@ class Client(object):
     # Train Jobs
     ####################################
     
+    # def create_train_job(self, 
+    #                     app, 
+    #                     task, 
+    #                     train_dataset_uri,
+    #                     test_dataset_uri, 
+    #                     budget_type=BudgetType.MODEL_TRIAL_COUNT, 
+    #                     budget_amount=10):
+    #     '''
+    #     Creates and starts a train job on Rafiki. 
+        
+    #     Only admins & app developers can manage train jobs.
+
+    #     :param str app: Name of the app associated with the train job
+    #     :param str task: Task associated with the train job, 
+    #         the train job will train models associated with the task
+    #     :param str train_dataset_uri: URI of the train dataset in a format specified by the task
+    #     :param str test_dataset_uri: URI of the test (development) dataset in a format specified by the task
+    #     :param budget_type: Type of budget for the train job
+    #     :type budget_type: :class:`rafiki.constants.BudgetType`
+    #     :param int budget_amount: Budget amount in units specific to the budget type
+    #     '''
+
+    #     data = self._post('/train_jobs', json={
+    #         'app': app,
+    #         'task': task,
+    #         'train_dataset_uri': train_dataset_uri,
+    #         'test_dataset_uri': test_dataset_uri,
+    #         'budget_type': budget_type,
+    #         'budget_amount': budget_amount
+    #     })
+    #     return data
+
     def create_train_job(self, 
                         app, 
-                        task, 
+                        task,
                         train_dataset_uri,
                         test_dataset_uri, 
-                        budget_type=BudgetType.MODEL_TRIAL_COUNT, 
-                        budget_amount=10):
+                        models,
+                        ensemble=None):
         '''
         Creates and starts a train job on Rafiki. 
         
@@ -159,20 +191,21 @@ class Client(object):
             the train job will train models associated with the task
         :param str train_dataset_uri: URI of the train dataset in a format specified by the task
         :param str test_dataset_uri: URI of the test (development) dataset in a format specified by the task
-        :param budget_type: Type of budget for the train job
-        :type budget_type: :class:`rafiki.constants.BudgetType`
-        :param int budget_amount: Budget amount in units specific to the budget type
+        :param list[dict] models: Models to be used for the train job task. Each model is specified in a 
+            dictionary with 3 keys: name, budget_type, budget_amount
+        :param dict ensemble: Ensemble model specified in a 
+            dictionary with 3 keys: name, budget_type, budget_amount
         '''
-
         data = self._post('/train_jobs', json={
             'app': app,
             'task': task,
             'train_dataset_uri': train_dataset_uri,
             'test_dataset_uri': test_dataset_uri,
-            'budget_type': budget_type,
-            'budget_amount': budget_amount
+            'models': models,
+            'ensemble': ensemble
         })
         return data
+        
 
     def get_train_jobs_by_user(self, user_id):
         '''

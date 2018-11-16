@@ -75,10 +75,10 @@ class TfVgg16(BaseModel):
         images = images.reshape(-1, 28, 28, 3)
         images = [np.asarray([img_to_array(array_to_img(im, scale=False).resize((48,48))) for im in images])]
 
-        with self._graph.as_default():
-            with self._sess.as_default():
-                (loss, accuracy) = self._model.evaluate(images, np.array(classes))
-        return accuracy
+        probabilities = self.predict(np.array(images))
+        predictions = np.argmax(probabilities, 1)
+        accuracy = sum(classes == predictions) / len(classes)
+        return accuracy, probabilities, classes
 
     def predict(self, queries):
         X = np.array(queries)

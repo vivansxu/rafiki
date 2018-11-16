@@ -3,12 +3,14 @@ import logging
 import traceback
 import bcrypt
 import pickle
+import json
 
 from rafiki.db import Database
-from rafiki.constants import ServiceStatus, UserType, ServiceType, TrainJobStatus
+from rafiki.constants import ServiceStatus, UserType, ServiceType, TrainJobStatus, TaskType
 from rafiki.config import MIN_SERVICE_PORT, MAX_SERVICE_PORT, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD
 from rafiki.container import DockerSwarmContainerManager 
 from rafiki.utils.log import JobLogger
+from rafiki.utils.graph import build_dag
 
 from .services_manager import ServicesManager
 
@@ -62,18 +64,67 @@ class Admin(object):
     # Train Job
     ####################################
 
+    # def create_train_job(self, user_id, app,
+    #     task, train_dataset_uri, test_dataset_uri,
+    #     budget_type, budget_amount):
+        
+    #     # Compute auto-incremented app version
+    #     train_jobs = self._db.get_train_jobs_of_app(app)
+    #     app_version = max([x.app_version for x in train_jobs], default=0) + 1
+
+    #     # Ensure that there are models associated with task
+    #     models = self._db.get_models_of_task(task)
+    #     if len(models) == 0:
+    #         raise NoModelsForTaskException()
+
+    #     train_job = self._db.create_train_job(
+    #         user_id=user_id,
+    #         app=app,
+    #         app_version=app_version,
+    #         task=task,
+    #         train_dataset_uri=train_dataset_uri,
+    #         test_dataset_uri=test_dataset_uri,
+    #         budget_type=budget_type,
+    #         budget_amount=budget_amount
+    #     )
+    #     self._db.commit()
+
+    #     train_job = self._services_manager.create_train_services(train_job.id)
+
+    #     return {
+    #         'id': train_job.id,
+    #         'app': train_job.app,
+    #         'app_version': train_job.app_version
+    #     }
+
     def create_train_job(self, user_id, app,
         task, train_dataset_uri, test_dataset_uri,
-        budget_type, budget_amount):
-        
+        models, ensemble):
+
         # Compute auto-incremented app version
         train_jobs = self._db.get_train_jobs_of_app(app)
-        app_version = max([x.app_version for x in train_jobs], default=0) + 1
+        app_version = max([x.app_version for x in train_jobs], default=0) + 1  
 
-        # Ensure that there are models associated with task
-        models = self._db.get_models_of_task(task)
+        # Check models are defined
         if len(models) == 0:
             raise NoModelsForTaskException()
+
+        # Check models are associated to task
+        registered_models = self._db.get_selected_models_of_task([model['name'] for model in models], task)
+        if len(registered_models) != len(models):
+            raise NoModelsForTaskException()
+
+        # Check ensemble model is registered
+        registered_ensemble_model = None
+        if ensemble is not None:
+            registered_ensemble_model = self._db.get_model_of_task(ensemble['name'], TaskType.ENSEMBLE)
+            if registered_ensemble_model is None:
+                raise NoModelsForTaskException
+            else:
+                registered_models.append(registered_ensemble_model)
+
+        # Build graph
+        graph = json.dumps(build_dag(models, ensemble))
 
         train_job = self._db.create_train_job(
             user_id=user_id,
@@ -82,12 +133,19 @@ class Admin(object):
             task=task,
             train_dataset_uri=train_dataset_uri,
             test_dataset_uri=test_dataset_uri,
-            budget_type=budget_type,
-            budget_amount=budget_amount
+            graph=graph
         )
-        self._db.commit()
 
-        train_job = self._services_manager.create_train_services(train_job.id)
+        # sub_train_jobs = []
+        # for registered_model in registered_models:
+        #     model = [model for model in models if model['name'] == registered_model.name][0]
+        #     sub_train_job = self._db.create_sub_train_job(
+        #         train_job_id=train_job.id,
+        #         model_id=registered_model.id,
+        #         budget_type=model['budget_type'],
+        #         budget_amount=model['budget_amount']
+        #     )
+        #     sub_train_jobs.append(sub_train_job)
 
         return {
             'id': train_job.id,

@@ -64,7 +64,6 @@ class Service(Base):
     container_service_name = Column(String)
     container_service_id = Column(String)
 
-
 class TrainJob(Base):
     __tablename__ = 'train_job'
 
@@ -74,20 +73,27 @@ class TrainJob(Base):
     task = Column(String, nullable=False)
     train_dataset_uri = Column(String, nullable=False)
     test_dataset_uri = Column(String, nullable=False)
-    datetime_started = Column(DateTime, nullable=False, default=generate_datetime)
+    graph = Column(String, nullable = False)
+    user_id = Column(String, ForeignKey('user.id'), nullable=False)
+
+class SubTrainJob(Base):
+    __tablename__='sub_train_job'
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    train_job_id = Column(String, ForeignKey('train_job.id'))
+    model_id = Column(String, ForeignKey('model.id'))
     budget_type = Column(String, nullable=False)
     budget_amount = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default=TrainJobStatus.STARTED)
-    user_id = Column(String, ForeignKey('user.id'), nullable=False)
+    datetime_started = Column(DateTime, nullable=False, default=generate_datetime)
     datetime_completed = Column(DateTime, default=None)
-
+    
 class TrainJobWorker(Base):
     __tablename__ = 'train_job_worker'
 
     service_id = Column(String, ForeignKey('service.id'), primary_key=True)
     train_job_id = Column(String, ForeignKey('train_job.id'))
     model_id = Column(String, ForeignKey('model.id'), nullable=False)
-
 
 class Trial(Base):
     __tablename__ = 'trial'

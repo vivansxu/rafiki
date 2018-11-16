@@ -91,8 +91,19 @@ def create_train_job(client):
         task=TaskType.IMAGE_CLASSIFICATION,
         train_dataset_uri=TRAIN_DATASET_URI,
         test_dataset_uri=TEST_DATASET_URI,
-        budget_type=BudgetType.MODEL_TRIAL_COUNT,
-        budget_amount=2
+        models=[
+            {
+                'name': 'SkDt',
+                'budget_type': BudgetType.MODEL_TRIAL_COUNT,
+                'budget_amount': 3
+            },
+            {
+                'name': 'TfSingleHiddenLayer',
+                'budget_type': BudgetType.MODEL_TRIAL_COUNT,
+                'budget_amount': 3
+            }
+        ],
+        ensemble=None
     )
     pprint.pprint(train_job)
 
@@ -179,27 +190,27 @@ if __name__ == '__main__':
     print('Creating train job for app "{}" on Rafiki...'.format(APP)) 
     (train_job_web_url) = create_train_job(client)
 
-    print('Waiting for train job to complete...')
-    print('You can view the status of the train job at {}.'.format(train_job_web_url))
-    print('Login as an app developer with email "{}" and password "{}".'.format(APP_DEVELOPER_EMAIL, USER_PASSWORD)) 
-    print('This might take a few minutes.')
-    result = wait_until_train_job_has_completed(client)
-    if not result: raise Exception('Train job has errored or stopped.')
-    print('Train job has been completed!')
+    # print('Waiting for train job to complete...')
+    # print('You can view the status of the train job at {}.'.format(train_job_web_url))
+    # print('Login as an app developer with email "{}" and password "{}".'.format(APP_DEVELOPER_EMAIL, USER_PASSWORD)) 
+    # print('This might take a few minutes.')
+    # result = wait_until_train_job_has_completed(client)
+    # if not result: raise Exception('Train job has errored or stopped.')
+    # print('Train job has been completed!')
 
-    print('Listing best trials of latest train job for app "{}"...'.format(APP))
-    list_best_trials_of_train_job(client)
+    # print('Listing best trials of latest train job for app "{}"...'.format(APP))
+    # list_best_trials_of_train_job(client)
 
-    print('Creating inference job for app "{}" on Rafiki...'.format(APP))
-    create_inference_job(client)
+    # print('Creating inference job for app "{}" on Rafiki...'.format(APP))
+    # create_inference_job(client)
 
-    print('Waiting for inference job to be running...')
-    predictor_host = wait_until_inference_job_is_running(client)
-    if not predictor_host: raise Exception('Inference job has errored or stopped.')
-    print('Inference job is running!')
+    # print('Waiting for inference job to be running...')
+    # predictor_host = wait_until_inference_job_is_running(client)
+    # if not predictor_host: raise Exception('Inference job has errored or stopped.')
+    # print('Inference job is running!')
 
-    print('Making predictions...')
-    make_predictions(client, predictor_host)
+    # print('Making predictions...')
+    # make_predictions(client, predictor_host)
 
-    print('Stopping inference job...')
-    stop_inference_job(client)
+    # print('Stopping inference job...')
+    # stop_inference_job(client)

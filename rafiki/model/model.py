@@ -189,7 +189,7 @@ def validate_model_class(model_class, train_dataset_uri, test_dataset_uri, task,
     model_inst.train(train_dataset_uri)
 
     print('Testing evaluation of model...')
-    score = model_inst.evaluate(test_dataset_uri)
+    (score, probabilities, classes) = model_inst.evaluate(test_dataset_uri)
 
     if not isinstance(score, float):
         raise InvalidModelClassException('`evaluate()` should return a float!')

@@ -54,9 +54,11 @@ class SkDt(BaseModel):
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
         X = self._prepare_X(images)
         y = classes
-        preds = self._clf.predict(X)
-        accuracy = sum(y == preds) / len(y)
-        return accuracy
+
+        probabilities = self.predict(X)
+        predictions = np.argmax(probabilities, 1)
+        accuracy = sum(y == predictions) / len(y)
+        return accuracy, probabilities, classes
 
     def predict(self, queries):
         X = self._prepare_X(queries)

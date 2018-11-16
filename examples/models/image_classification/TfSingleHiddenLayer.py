@@ -72,12 +72,10 @@ class TfSingleHiddenLayer(BaseModel):
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
 
-        with self._graph.as_default():
-            with self._sess.as_default():
-                (loss, accuracy) = self._model.evaluate(np.array(images), np.array(classes))
-                self.utils.log('Test loss: {}'.format(loss))
-
-        return accuracy
+        probabilities = self.predict(np.array(images))        
+        predictions = np.argmax(probabilities, 1)
+        accuracy = sum(classes == predictions) / len(classes)
+        return accuracy, probabilities, classes
 
     def predict(self, queries):
         X = np.array(queries)
