@@ -53,16 +53,16 @@ class CorpusDataset(ModelDataset):
     with tags appearing in the same order as ``tags``. 
     '''   
 
-    def __init__(self, dataset_path, tags, split_by):
-        super().__init__(dataset_path)
+    def __init__(self, dataset_path, tags, split_by, limit=None, **kwargs):
+        super().__init__(dataset_path, **kwargs)
         self.tags = tags
         (self.size, self.tag_num_classes, self.max_token_len, self.max_sent_len, self._sents) = \
-            self._load(self.path, self.tags, split_by)
+            self._load(self.path, self.tags, split_by, limit=limit)
 
     def __getitem__(self, index):
         return self._sents[index]
 
-    def _load(self, dataset_path, tags, split_by):
+    def _load(self, dataset_path, tags, split_by, limit=None):
         sents = []
         tag_num_classes = [0 for _ in range(len(tags))]
         max_token_len = 0
@@ -108,6 +108,9 @@ class CorpusDataset(ModelDataset):
                 raise InvalidDatasetFormatException()
 
         size = len(sents)
+        if limit is not None:
+            size = min(limit, size)
+            sents = sents[0:size]
 
         return (size, tag_num_classes, max_token_len, max_sent_len, sents)
 
@@ -120,11 +123,11 @@ class ImageFilesDataset(ModelDataset):
     of integers (0, 255) as grayscale, each class is an integer from 0 to (k - 1).
     '''   
 
-    def __init__(self, dataset_path, image_size):
-        super().__init__(dataset_path)
+    def __init__(self, dataset_path, image_size=None, limit=None, **kwargs):
+        super().__init__(dataset_path, **kwargs)
         self.image_size = image_size
         (self.size, self.classes, self._image_paths, 
-            self._image_classes, self._dataset_dir) = self._load(self.path)
+            self._image_classes, self._dataset_dir) = self._load(self.path, limit=limit)
 
     def __getitem__(self, index):
         image_path = self._image_paths[index]
@@ -144,7 +147,7 @@ class ImageFilesDataset(ModelDataset):
 
         return (image, image_class)
 
-    def _load(self, dataset_path):
+    def _load(self, dataset_path, limit=None):
         image_paths = []
         image_classes = [] 
 
@@ -166,9 +169,13 @@ class ImageFilesDataset(ModelDataset):
             raise InvalidDatasetFormatException()
 
         num_classes = len(set(image_classes))
-        num_samples = len(image_paths)
+        size = len(image_paths)
+        if limit is not None:
+            size = min(limit, size)
+            image_paths = image_paths[0:size]
+            image_classes = image_classes[0:size]
 
-        return (num_samples, num_classes, image_paths, image_classes, dataset_dir)
+        return (size, num_classes, image_paths, image_classes, dataset_dir)
 
 class ModelDatasetUtils():
     '''
@@ -178,7 +185,7 @@ class ModelDatasetUtils():
         # Caches downloaded datasets
         self._dataset_uri_to_path = {}
 
-    def load_dataset_of_corpus(self, dataset_uri, tags=['tag'], split_by='\\n'):
+    def load_dataset_of_corpus(self, dataset_uri, tags=['tag'], split_by='\\n', **kwargs):
         '''
             Loads dataset with type `CORPUS`.
             
@@ -186,9 +193,9 @@ class ModelDatasetUtils():
             :returns: An instance of ``CorpusDataset``.
         '''
         dataset_path = self.download_dataset_from_uri(dataset_uri)
-        return CorpusDataset(dataset_path, tags, split_by)
+        return CorpusDataset(dataset_path, tags, split_by, **kwargs)
 
-    def load_dataset_of_image_files(self, dataset_uri, image_size=None):
+    def load_dataset_of_image_files(self, dataset_uri, image_size=None, **kwargs):
         '''
             Loads dataset with type `IMAGE_FILES`.
 
@@ -197,7 +204,7 @@ class ModelDatasetUtils():
             :returns: An instance of ``ImageFilesDataset``.
         '''
         dataset_path = self.download_dataset_from_uri(dataset_uri)
-        return ImageFilesDataset(dataset_path, image_size)
+        return ImageFilesDataset(dataset_path, image_size, **kwargs)
 
     def resize_as_images(self, images, image_size):
         '''
