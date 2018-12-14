@@ -6,7 +6,7 @@ import pickle
 import json
 
 from rafiki.db import Database
-from rafiki.constants import ServiceStatus, UserType, ServiceType, TrainJobStatus, TaskType
+from rafiki.constants import ServiceStatus, UserType, ServiceType, TrainJobStatus, TaskType, ModelAccessRights
 from rafiki.config import MIN_SERVICE_PORT, MAX_SERVICE_PORT, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD
 from rafiki.container import DockerSwarmContainerManager 
 from rafiki.utils.log import JobLogger
@@ -64,39 +64,6 @@ class Admin(object):
     # Train Job
     ####################################
 
-    # def create_train_job(self, user_id, app,
-    #     task, train_dataset_uri, test_dataset_uri,
-    #     budget_type, budget_amount):
-        
-    #     # Compute auto-incremented app version
-    #     train_jobs = self._db.get_train_jobs_of_app(app)
-    #     app_version = max([x.app_version for x in train_jobs], default=0) + 1
-
-    #     # Ensure that there are models associated with task
-    #     models = self._db.get_models_of_task(task)
-    #     if len(models) == 0:
-    #         raise NoModelsForTaskException()
-
-    #     train_job = self._db.create_train_job(
-    #         user_id=user_id,
-    #         app=app,
-    #         app_version=app_version,
-    #         task=task,
-    #         train_dataset_uri=train_dataset_uri,
-    #         test_dataset_uri=test_dataset_uri,
-    #         budget_type=budget_type,
-    #         budget_amount=budget_amount
-    #     )
-    #     self._db.commit()
-
-    #     train_job = self._services_manager.create_train_services(train_job.id)
-
-    #     return {
-    #         'id': train_job.id,
-    #         'app': train_job.app,
-    #         'app_version': train_job.app_version
-    #     }
-
     def create_train_job(self, user_id, app,
         task, train_dataset_uri, test_dataset_uri,
         models, ensemble):
@@ -110,21 +77,25 @@ class Admin(object):
             raise NoModelsForTaskException()
 
         # Check models are associated to task
-        registered_models = self._db.get_selected_models_of_task([model['name'] for model in models], task)
+        registered_models = self._db.get_selected_models_of_task(
+            [model['name'] for model in models], 
+            task
+        )
         if len(registered_models) != len(models):
             raise NoModelsForTaskException()
 
         # Check ensemble model is registered
         registered_ensemble_model = None
         if ensemble is not None:
-            registered_ensemble_model = self._db.get_model_of_task(ensemble['name'], TaskType.ENSEMBLE)
+            registered_ensemble_model = self._db.get_model_of_task(
+                ensemble['name'], 
+                TaskType.TASK_ENSEMBLE_MAPPING[task]
+            )
             if registered_ensemble_model is None:
                 raise NoModelsForTaskException
             else:
+                models.append(ensemble)
                 registered_models.append(registered_ensemble_model)
-
-        # Build graph
-        graph = json.dumps(build_dag(models, ensemble))
 
         train_job = self._db.create_train_job(
             user_id=user_id,
@@ -132,26 +103,37 @@ class Admin(object):
             app_version=app_version,
             task=task,
             train_dataset_uri=train_dataset_uri,
-            test_dataset_uri=test_dataset_uri,
-            graph=graph
+            test_dataset_uri=test_dataset_uri
         )
+        self._db.commit()
 
-        # sub_train_jobs = []
-        # for registered_model in registered_models:
-        #     model = [model for model in models if model['name'] == registered_model.name][0]
-        #     sub_train_job = self._db.create_sub_train_job(
-        #         train_job_id=train_job.id,
-        #         model_id=registered_model.id,
-        #         budget_type=model['budget_type'],
-        #         budget_amount=model['budget_amount']
-        #     )
-        #     sub_train_jobs.append(sub_train_job)
+        sub_train_jobs = []
+        for registered_model in registered_models:
+            model = [model for model in models if model['name'] == registered_model.name][0]
+            sub_train_job = self._db.create_sub_train_job(
+                train_job_id=train_job.id,
+                model_id=registered_model.id,
+                budget_type=model['budget_type'],
+                budget_amount=model['budget_amount']
+            )
+            self._db.commit()
+            sub_train_jobs.append(sub_train_job)
+
+        # Build graph
+        graph = build_dag(sub_train_jobs, registered_ensemble_model)
+        train_job.graph = graph
+        self._db.commit()
+        self._services_manager.create_train_services(train_job.id)
 
         return {
             'id': train_job.id,
             'app': train_job.app,
             'app_version': train_job.app_version
         }
+
+    def get_train_job_status(self, app, app_version=-1):
+        #TODO
+        pass
 
     def stop_train_job(self, app, app_version=-1):
         train_job = self._db.get_train_job_by_app_version(app, app_version=app_version)
@@ -282,8 +264,8 @@ class Admin(object):
         worker = self._services_manager.stop_train_job_worker(service_id)
         return {
             'service_id': worker.service_id,
-            'model_id': worker.model_id,
-            'train_job_id': worker.train_job_id
+            'train_job_id': worker.train_job_id,
+            'sub_train_job_id': worker.sub_train_job_id
         }
 
     ####################################
@@ -444,14 +426,15 @@ class Admin(object):
     ####################################
 
     def create_model(self, user_id, name, task, 
-                    model_file_bytes, model_class, docker_image=None):
+                    model_file_bytes, model_class, docker_image=None, access_rights=ModelAccessRights.PUBLIC):
         model = self._db.create_model(
             user_id=user_id,
             name=name,
             task=task,
             model_file_bytes=model_file_bytes,
             model_class=model_class,
-            docker_image=(docker_image or self._base_worker_image)
+            docker_image=(docker_image or self._base_worker_image),
+            access_rights=access_rights
         )
 
         return {

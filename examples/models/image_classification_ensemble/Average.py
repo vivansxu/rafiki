@@ -1,115 +1,180 @@
-from sklearn import svm
+import tensorflow as tf
+from tensorflow import keras
 import json
-import pickle
 import os
-import base64
+import tempfile
 import numpy as np
+import base64
 
 from rafiki.model import BaseModel, InvalidModelParamsException, validate_model_class
 from rafiki.constants import TaskType
 
-class SkSvm(BaseModel):
+EPOCHS = 3
+
+class Average(BaseModel):
     '''
-    Implements a SVM on scikit-learn
+    Implements a fully-connected neural network with a single hidden layer on Tensorflow
     '''
 
     def get_knob_config(self):
+        # return {
+        #     'knobs': {
+        #         'hidden_layer_units': {
+        #             'type': 'int',
+        #             'range': [2, 128]
+        #         },
+        #         'learning_rate': {
+        #             'type': 'float_exp',
+        #             'range': [1e-5, 1e-1]
+        #         },
+        #         'batch_size': {
+        #             'type': 'int_cat',
+        #             'values': [1, 2, 4, 8, 16, 32, 64, 128]
+        #         }
+        #     }
+        # }
         return {
             'knobs': {
-                'max_iter': {
+                'hidden_layer_units': {
                     'type': 'int',
-                    'range': [10, 10]
+                    'range': [2, 3]
                 },
-                'kernel': {
-                    'type': 'string',
-                    'values': ['rbf', 'linear']
-                },
-                'gamma': {
-                    'type': 'string',
-                    'values': ['scale', 'auto']
-                },
-                'C': {
+                'learning_rate': {
                     'type': 'float_exp',
-                    'range': [1e-2, 1e2]
+                    'range': [1e-2, 1e-1]
+                },
+                'batch_size': {
+                    'type': 'int_cat',
+                    'values': [32, 64]
                 }
             }
         }
 
     def init(self, knobs):
-        self._max_iter = knobs.get('max_iter') 
-        self._kernel = knobs.get('kernel') 
-        self._gamma = knobs.get('gamma') 
-        self._C = knobs.get('C') 
-        self._clf = self._build_classifier(
-            self._max_iter,
-            self._kernel,
-            self._gamma,
-            self._C
-        )
+        self._batch_size = knobs.get('batch_size')
+        self._hidden_layer_units = knobs.get('hidden_layer_units')
+        self._learning_rate = knobs.get('learning_rate')
+
+        self._graph = tf.Graph()
+        self._sess = tf.Session(graph=self._graph)
+        self._define_plots()
         
     def train(self, dataset_uri, train_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
-        X = self._prepare_X(images)
-        y = classes
-        self._clf.fit(X, y)
+
+        with self._graph.as_default():
+            self._model = self._build_model(num_classes)
+            with self._sess.as_default():
+                self._model.fit(
+                    np.array(images), 
+                    np.array(classes), 
+                    verbose=0,
+                    epochs=EPOCHS,
+                    batch_size=self._batch_size,
+                    callbacks=[
+                        tf.keras.callbacks.LambdaCallback(on_epoch_end=self._on_train_epoch_end)
+                    ]
+                )
+
+                # Compute train accuracy
+                (loss, accuracy) = self._model.evaluate(np.array(images), np.array(classes))
+                self.utils.log('Train loss: {}'.format(loss))
+                self.utils.log('Train accuracy: {}'.format(accuracy))
 
     def evaluate(self, dataset_uri, test_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
-        X = self._prepare_X(images)
-        y = classes
 
-        probabilities = self.predict(X)
+        probabilities = self.predict(np.array(images))        
         predictions = np.argmax(probabilities, 1)
-        accuracy = sum(y == predictions) / len(y)
+        accuracy = sum(classes == predictions) / len(classes)
         return accuracy, probabilities, classes
 
     def predict(self, queries):
-        X = self._prepare_X(queries)
-        probs = self._clf.predict_proba(X)
+        X = np.array(queries)
+        with self._graph.as_default():
+            with self._sess.as_default():
+                probs = self._model.predict(X)
+                
         return probs.tolist()
 
     def destroy(self):
-        pass
+        self._sess.close()
 
     def dump_parameters(self):
         params = {}
 
         # Save model parameters
-        clf_bytes = pickle.dumps(self._clf)
-        clf_base64 = base64.b64encode(clf_bytes).decode('utf-8')
-        params['clf_base64'] = clf_base64
+        with tempfile.NamedTemporaryFile() as tmp:
+            # Save whole model to temp h5 file
+            with self._graph.as_default():
+                with self._sess.as_default():
+                    self._model.save(tmp.name)
         
+            # Read from temp h5 file & encode it to base64 string
+            with open(tmp.name, 'rb') as f:
+                h5_model_bytes = f.read()
+
+            params['h5_model_base64'] = base64.b64encode(h5_model_bytes).decode('utf-8')
+
         return params
 
     def load_parameters(self, params):
         # Load model parameters
-        clf_base64 = params.get('clf_base64', None)
-        if clf_base64 is None:
+        h5_model_base64 = params.get('h5_model_base64', None)
+        if h5_model_base64 is None:
             raise InvalidModelParamsException()
+
+        with tempfile.NamedTemporaryFile() as tmp:
+            # Convert back to bytes & write to temp file
+            h5_model_bytes = base64.b64decode(h5_model_base64.encode('utf-8'))
+            with open(tmp.name, 'wb') as f:
+                f.write(h5_model_bytes)
+
+            # Load model from temp file
+            with self._graph.as_default():
+                with self._sess.as_default():
+                    self._model = keras.models.load_model(tmp.name)
+
+    def _on_train_epoch_end(self, epoch, logs):
+        loss = logs['loss']
+        self.utils.log_loss_metric(loss, epoch)
+
+    def _define_plots(self):
+        # Define 2 plots: Loss against time, loss against epochs
+        self.utils.define_loss_plot()
+        self.utils.define_plot('Loss Over Time', ['loss'])
+
+    def _build_model(self, num_classes):
+        hidden_layer_units = self._hidden_layer_units
+        learning_rate = self._learning_rate
+
+        model = keras.Sequential()
+        model.add(keras.layers.Flatten())
+        model.add(keras.layers.BatchNormalization())
+        model.add(keras.layers.Dense(
+            hidden_layer_units,
+            activation=tf.nn.relu
+        ))
+        model.add(keras.layers.Dense(
+            num_classes, 
+            activation=tf.nn.softmax
+        ))
         
-        clf_bytes = base64.b64decode(params['clf_base64'].encode('utf-8'))
-        self._clf = pickle.loads(clf_bytes)
+        model.compile(
+            optimizer=keras.optimizers.Adam(lr=learning_rate),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        return model
 
-    def _prepare_X(self, images):
-        return [np.array(image).flatten() for image in images]
-
-    def _build_classifier(self, max_iter, kernel, gamma, C):
-        clf = svm.SVC(
-            max_iter=max_iter,
-            kernel=kernel,
-            gamma=gamma,
-            C=C,
-            probability=True
-        ) 
-        return clf
 
 if __name__ == '__main__':
     validate_model_class(
-        model_class=SkSvm,
+        model_class=TfSingleHiddenLayer,
         train_dataset_uri='data/fashion_mnist_as_image_files_train.zip',
         test_dataset_uri='data/fashion_mnist_as_image_files_test.zip',
         task=TaskType.IMAGE_CLASSIFICATION,

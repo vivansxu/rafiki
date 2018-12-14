@@ -15,14 +15,31 @@ class Cache(object):
         port=os.environ.get('REDIS_PORT', 6379),
         db=INFERENCE_WORKER_CACHE_DATABASE_NUMBER):
 
-        cache_connection_url = self._make_connection_url(
-            host=host,
-            port=port,
-            db=db
-        )
+        self._host = host
+        self._port = port
+        self._db = db
+
+        cache_connection_url = self.get_connection_url()
 
         self._connection_pool = redis.ConnectionPool.from_url(cache_connection_url)
         self._redis = redis.StrictRedis(connection_pool=self._connection_pool, decode_responses=True)
+
+    def add_dataset_predictions(self, predictions, classes):
+        prediction_id = str(uuid.uuid4())
+        predictions = json.dumps({
+            'predictions': predictions,
+            'classes': classes
+        })
+
+        self._redis.set(prediction_id, predictions)
+        return '{}?{}'.format(self.get_connection_url(), prediction_id)
+
+    def get_dataset_predictions(self, prediction_id):
+        predictions = json.loads(self._redis.get(prediction_id))
+        return (predictions['predictions'], predictions['classes'])
+
+    def delete_dataset_predictions(self, prediction_id):
+        self._redis.delete(prediction_id)
         
     def add_worker_of_inference_job(self, worker_id, inference_job_id):
         inference_workers_key = '{}_{}'.format(RUNNING_INFERENCE_WORKERS, inference_job_id)
@@ -81,5 +98,5 @@ class Cache(object):
         # Return None if prediction is not found
         return None
 
-    def _make_connection_url(self, host, port, db):
-        return 'redis://{}:{}/{}'.format(host, port, db)
+    def get_connection_url(self):
+        return 'redis://{}:{}/{}'.format(self._host, self._port, self._db)

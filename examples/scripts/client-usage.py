@@ -3,7 +3,7 @@ import time
 import requests
 
 from rafiki.client import Client
-from rafiki.constants import TaskType, BudgetType, TrainJobStatus, InferenceJobStatus
+from rafiki.constants import TaskType, BudgetType, TrainJobStatus, InferenceJobStatus, ModelAccessRights
 
 RAFIKI_HOST = 'localhost'
 ADMIN_PORT = 8000
@@ -71,7 +71,8 @@ def create_models(client):
             name='TfSingleHiddenLayer',
             task=TaskType.IMAGE_CLASSIFICATION,
             model_file_path='examples/models/image_classification/TfSingleHiddenLayer.py',
-            model_class='TfSingleHiddenLayer'
+            model_class='TfSingleHiddenLayer',
+            access_rights=ModelAccessRights.PRIVATE
         )
     )
 
@@ -81,7 +82,19 @@ def create_models(client):
             name='SkDt',
             task=TaskType.IMAGE_CLASSIFICATION,
             model_file_path='examples/models/image_classification/SkDt.py',
-            model_class='SkDt'
+            model_class='SkDt',
+            access_rights=ModelAccessRights.PRIVATE
+        )
+    )
+
+    # Add Average ensembler to Rafiki
+    pprint.pprint(
+        client.create_model(
+            name='Average',
+            task=TaskType.IMAGE_CLASSIFICATION_ENSEMBLE,
+            model_file_path='examples/models/image_classification_ensemble/Average.py',
+            model_class='Average',
+            access_rights=ModelAccessRights.PRIVATE
         )
     )
 
@@ -95,15 +108,14 @@ def create_train_job(client):
             {
                 'name': 'SkDt',
                 'budget_type': BudgetType.MODEL_TRIAL_COUNT,
-                'budget_amount': 3
-            },
-            {
-                'name': 'TfSingleHiddenLayer',
-                'budget_type': BudgetType.MODEL_TRIAL_COUNT,
-                'budget_amount': 3
+                'budget_amount': 1
             }
         ],
-        ensemble=None
+        ensemble={
+            'name': 'Average',
+            'budget_type': BudgetType.MODEL_TRIAL_COUNT,
+            'budget_amount': 1           
+        }
     )
     pprint.pprint(train_job)
 

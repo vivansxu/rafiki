@@ -14,15 +14,27 @@ class SkDt(BaseModel):
     '''
 
     def get_knob_config(self):
+        # return {
+        #     'knobs': {
+        #         'max_depth': {
+        #             'type': 'int',
+        #             'range': [2, 8]
+        #         },
+        #         'criterion': {
+        #             'type': 'string',
+        #             'values': ['gini', 'entropy']
+        #         },
+        #     }
+        # }
         return {
             'knobs': {
                 'max_depth': {
                     'type': 'int',
-                    'range': [2, 8]
+                    'range': [2, 3]
                 },
                 'criterion': {
                     'type': 'string',
-                    'values': ['gini', 'entropy']
+                    'values': ['gini']
                 },
             }
         }
@@ -35,7 +47,7 @@ class SkDt(BaseModel):
             self._criterion
         )
         
-    def train(self, dataset_uri):
+    def train(self, dataset_uri, train_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
@@ -48,7 +60,7 @@ class SkDt(BaseModel):
         accuracy = sum(y == preds) / len(y)
         self.utils.log('Train accuracy: {}'.format(accuracy))
 
-    def evaluate(self, dataset_uri):
+    def evaluate(self, dataset_uri, test_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])

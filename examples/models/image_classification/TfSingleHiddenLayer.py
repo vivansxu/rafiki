@@ -17,19 +17,35 @@ class TfSingleHiddenLayer(BaseModel):
     '''
 
     def get_knob_config(self):
+        # return {
+        #     'knobs': {
+        #         'hidden_layer_units': {
+        #             'type': 'int',
+        #             'range': [2, 128]
+        #         },
+        #         'learning_rate': {
+        #             'type': 'float_exp',
+        #             'range': [1e-5, 1e-1]
+        #         },
+        #         'batch_size': {
+        #             'type': 'int_cat',
+        #             'values': [1, 2, 4, 8, 16, 32, 64, 128]
+        #         }
+        #     }
+        # }
         return {
             'knobs': {
                 'hidden_layer_units': {
                     'type': 'int',
-                    'range': [2, 128]
+                    'range': [2, 3]
                 },
                 'learning_rate': {
                     'type': 'float_exp',
-                    'range': [1e-5, 1e-1]
+                    'range': [1e-2, 1e-1]
                 },
                 'batch_size': {
                     'type': 'int_cat',
-                    'values': [1, 2, 4, 8, 16, 32, 64, 128]
+                    'values': [32, 64]
                 }
             }
         }
@@ -43,7 +59,7 @@ class TfSingleHiddenLayer(BaseModel):
         self._sess = tf.Session(graph=self._graph)
         self._define_plots()
         
-    def train(self, dataset_uri):
+    def train(self, dataset_uri, train_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
@@ -67,7 +83,7 @@ class TfSingleHiddenLayer(BaseModel):
                 self.utils.log('Train loss: {}'.format(loss))
                 self.utils.log('Train accuracy: {}'.format(accuracy))
 
-    def evaluate(self, dataset_uri):
+    def evaluate(self, dataset_uri, test_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])

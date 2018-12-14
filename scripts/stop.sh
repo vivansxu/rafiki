@@ -24,8 +24,10 @@ docker rm -f $ADMIN_HOST || echo "Failed to stop Rafiki's Admin"
 title "Stopping Rafiki's Advisor..."
 docker rm -f $ADVISOR_HOST || echo "Failed to stop Rafiki's Advisor"
 
-title "Stopping Rafiki's Admin Web..."
-docker rm -f $ADMIN_WEB_HOST || echo "Failed to stop Rafiki's Admin Web"
+# title "Stopping Rafiki's Admin Web..."
+# docker rm -f $ADMIN_WEB_HOST || echo "Failed to stop Rafiki's Admin Web"
+
+# docker service rm $(docker service ls)
 
 echo "You'll need to destroy your machine's Docker swarm & Rafiki's logs folder at $LOGS_FOLDER_PATH manually"
 

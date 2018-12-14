@@ -5,7 +5,7 @@ import uuid
 import datetime
 
 from rafiki.constants import InferenceJobStatus, ServiceStatus, TrainJobStatus, \
-    TrialStatus
+    TrialStatus, ModelAccessRights
 
 Base = declarative_base()
 
@@ -44,7 +44,7 @@ class Model(Base):
     model_class = Column(String, nullable=False)
     user_id = Column(String, ForeignKey('user.id'), nullable=False)
     docker_image = Column(String, nullable=False)
-
+    access_rights = Column(String, nullable=False, default=ModelAccessRights.PUBLIC)
 
 class Service(Base):
     __tablename__ = 'service'
@@ -73,7 +73,7 @@ class TrainJob(Base):
     task = Column(String, nullable=False)
     train_dataset_uri = Column(String, nullable=False)
     test_dataset_uri = Column(String, nullable=False)
-    graph = Column(String, nullable = False)
+    graph = Column(JSON, default=None)
     user_id = Column(String, ForeignKey('user.id'), nullable=False)
 
 class SubTrainJob(Base):
@@ -85,6 +85,8 @@ class SubTrainJob(Base):
     budget_type = Column(String, nullable=False)
     budget_amount = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default=TrainJobStatus.STARTED)
+    prediction_train_uri = Column(String, default=None)
+    prediction_test_uri = Column(String, default=None)
     datetime_started = Column(DateTime, nullable=False, default=generate_datetime)
     datetime_completed = Column(DateTime, default=None)
     
@@ -92,8 +94,8 @@ class TrainJobWorker(Base):
     __tablename__ = 'train_job_worker'
 
     service_id = Column(String, ForeignKey('service.id'), primary_key=True)
-    train_job_id = Column(String, ForeignKey('train_job.id'))
-    model_id = Column(String, ForeignKey('model.id'), nullable=False)
+    train_job_id = Column(String, ForeignKey('train_job.id'), nullable=False)
+    sub_train_job_id = Column(String, ForeignKey('sub_train_job.id'), nullable=False)
 
 class Trial(Base):
     __tablename__ = 'trial'
@@ -101,8 +103,7 @@ class Trial(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     knobs = Column(JSON, nullable=False)
     datetime_started = Column(DateTime, nullable=False, default=generate_datetime)
-    train_job_id = Column(String, ForeignKey('train_job.id'), nullable=False)
-    model_id = Column(String, ForeignKey('model.id'), nullable=False)
+    sub_train_job_id = Column(String, ForeignKey('sub_train_job.id'), nullable=False)
     status = Column(String, nullable=False, default=TrialStatus.RUNNING)
     score = Column(Float, default=0)
     parameters = Column(Binary, default=None)

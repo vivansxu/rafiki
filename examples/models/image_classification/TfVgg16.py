@@ -45,7 +45,7 @@ class TfVgg16(BaseModel):
         self._graph = tf.Graph()
         self._sess = tf.Session(graph=self._graph)
 
-    def train(self, dataset_uri):
+    def train(self, dataset_uri, train_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
@@ -65,7 +65,7 @@ class TfVgg16(BaseModel):
                     batch_size=self._batch_size
                 )
 
-    def evaluate(self, dataset_uri):
+    def evaluate(self, dataset_uri, test_uris=[]):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (num_samples, num_classes) = next(dataset)
         (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])

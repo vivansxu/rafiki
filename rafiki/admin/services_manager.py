@@ -4,17 +4,19 @@ import traceback
 import time
 
 from rafiki.db import Database
-from rafiki.constants import ServiceStatus, UserType, ServiceType
+from rafiki.constants import ServiceStatus, UserType, ServiceType, TrainJobStatus
 from rafiki.config import MIN_SERVICE_PORT, MAX_SERVICE_PORT, \
     TRAIN_WORKER_REPLICAS_PER_MODEL, INFERENCE_WORKER_REPLICAS_PER_TRIAL, \
     INFERENCE_MAX_BEST_TRIALS, SERVICE_STATUS_WAIT
 from rafiki.container import DockerSwarmContainerManager 
+from rafiki.utils.graph import get_nodes_with_zero_incoming_degrees, get_children, get_parents
 
 logger = logging.getLogger(__name__)
 
 class ServiceDeploymentException(Exception): pass
 
 class ServicesManager(object):
+
     def __init__(self, db=Database(), container_manager=DockerSwarmContainerManager()):
         self._predictor_image = '{}:{}'.format(os.environ['RAFIKI_IMAGE_PREDICTOR'],
                                                 os.environ['RAFIKI_VERSION'])
@@ -75,15 +77,20 @@ class ServicesManager(object):
 
     def create_train_services(self, train_job_id):
         train_job = self._db.get_train_job(train_job_id)
+        sub_train_jobs = self._db.get_sub_train_jobs_by_train_job(train_job_id)
+
+        # Get starting nodes in graph
+        sources = get_nodes_with_zero_incoming_degrees(train_job.graph)
+        sub_train_jobs = [sub_train_job for sub_train_job in sub_train_jobs if sub_train_job.id in sources]
         
-        # Create a worker service for each model
-        models = self._db.get_models_of_task(train_job.task)
-        model_to_replicas = self._compute_train_worker_replicas_for_models(models)
-        for (model, replicas) in model_to_replicas.items():
-            self._create_train_job_worker(train_job, model, replicas)
+        # Create a worker service for each sub_train_job
+        sub_train_jobs_to_replicas = self._compute_train_worker_replicas_for_sub_train_jobs(sub_train_jobs)
+        for (sub_train_job, replicas) in sub_train_jobs_to_replicas.items():
+            self._create_train_job_worker(train_job, sub_train_job, replicas)
 
         # Mark train job as running
-        self._db.mark_train_job_as_running(train_job)
+        for sub_train_job in sub_train_jobs:
+            self._db.mark_sub_train_job_as_running(sub_train_job)
         self._db.commit()
 
         return train_job
@@ -160,7 +167,7 @@ class ServicesManager(object):
 
         return service
 
-    def _create_train_job_worker(self, train_job, model, replicas):
+    def _create_train_job_worker(self, train_job, sub_train_job, replicas):
         service_type = ServiceType.TRAIN
         environment_vars = {
             'POSTGRES_HOST': os.environ['POSTGRES_HOST'],
@@ -168,6 +175,8 @@ class ServicesManager(object):
             'POSTGRES_USER': os.environ['POSTGRES_USER'],
             'POSTGRES_DB': os.environ['POSTGRES_DB'],
             'POSTGRES_PASSWORD': os.environ['POSTGRES_PASSWORD'],
+            'REDIS_HOST': os.environ['REDIS_HOST'],
+            'REDIS_PORT': os.environ['REDIS_PORT'],
             'LOGS_FOLDER_PATH': os.environ['LOGS_FOLDER_PATH'],
             'ADMIN_HOST': os.environ['ADMIN_HOST'],
             'ADMIN_PORT': os.environ['ADMIN_PORT'],
@@ -175,6 +184,7 @@ class ServicesManager(object):
             'ADVISOR_PORT': os.environ['ADVISOR_PORT']
         }
 
+        model = self._db.get_model(sub_train_job.model_id)
         service = self._create_service(
             service_type=service_type,
             docker_image=model.docker_image,
@@ -185,29 +195,63 @@ class ServicesManager(object):
         self._db.create_train_job_worker(
             service_id=service.id,
             train_job_id=train_job.id,
-            model_id=model.id
+            sub_train_job_id=sub_train_job.id
         )
         self._db.commit()
 
         return service
 
     def _stop_train_job_worker(self, worker):
+        logger.info('203')
         service = self._db.get_service(worker.service_id)
+        logger.info('205')
         self._stop_service(service)
-        train_job = self._db.get_train_job(worker.train_job_id)
-        self._update_train_job_status(train_job)
+        logger.info('207')
+        sub_train_job = self._db.get_sub_train_job(worker.sub_train_job_id)
+        logger.info('209')
+        self._update_sub_train_job_status(sub_train_job)
+        logger.info('211')
+        self._start_children_sub_train_jobs(sub_train_job)
 
-    def _update_train_job_status(self, train_job):
-        workers = self._db.get_workers_of_train_job(train_job.id)
+    def _update_sub_train_job_status(self, sub_train_job):
+        workers = self._db.get_workers_of_sub_train_job(sub_train_job.id)
         services = [self._db.get_service(x.service_id) for x in workers]
         
-        # If all workers for the train job have stopped, stop train job as well
+        # If all workers for the sub train job have stopped, stop train job as well
         if next((
             x for x in services 
             if x.status in [ServiceStatus.RUNNING, ServiceStatus.STARTED, ServiceStatus.DEPLOYING]
         ), None) is None:
-            self._db.mark_train_job_as_complete(train_job)
+            self._db.mark_sub_train_job_as_complete(sub_train_job)
             self._db.commit()
+
+    def _start_children_sub_train_jobs(self, sub_train_job):
+        train_job = self._db.get_train_job(sub_train_job.train_job_id)
+        children = get_children(sub_train_job.id, train_job.graph)
+        logger.info('229')
+
+        sub_train_jobs = []
+        for child in children:
+            parents = get_parents(sub_train_job.id, train_job.graph)
+            is_parents_completed = True
+            for parent in parents:
+                parent_sub_train_job = self._db.get_sub_train_job(parent)
+                if parent_sub_train_job.status != TrainJobStatus.COMPLETED:
+                    is_parents_completed = False
+                    break
+            if is_parents_completed:
+                child_sub_train_job = self._db.get_sub_train_job(child)
+                sub_train_jobs.append(child_sub_train_job)
+
+        # Create a worker service for each sub_train_job
+        sub_train_jobs_to_replicas = self._compute_train_worker_replicas_for_sub_train_jobs(sub_train_jobs)
+        for (sub_train_job, replicas) in sub_train_jobs_to_replicas.items():
+            self._create_train_job_worker(train_job, sub_train_job, replicas)
+
+        # Mark train job as running
+        for sub_train_job in sub_train_jobs:
+            self._db.mark_sub_train_job_as_running(sub_train_job)
+        self._db.commit()
 
     def _stop_service(self, service):
         if service.container_service_id is not None:
@@ -320,15 +364,13 @@ class ServicesManager(object):
         )
         return best_trials
 
-    def _compute_train_worker_replicas_for_models(self, models):
-        # TODO: Improve provisioning algorithm
+    def _compute_train_worker_replicas_for_sub_train_jobs(self, sub_train_jobs):
         return {
-            model : TRAIN_WORKER_REPLICAS_PER_MODEL
-            for model in models
+            sub_train_job : TRAIN_WORKER_REPLICAS_PER_MODEL
+            for sub_train_job in sub_train_jobs
         }
 
     def _compute_inference_worker_replicas_for_trials(self, trials):
-        # TODO: Improve provisioning algorithm
         return {
             trial : INFERENCE_WORKER_REPLICAS_PER_TRIAL
             for trial in trials

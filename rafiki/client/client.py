@@ -1,7 +1,7 @@
 import requests
 import pprint
 
-from rafiki.constants import BudgetType
+from rafiki.constants import BudgetType, ModelAccessRights
 
 class Client(object):
 
@@ -88,7 +88,8 @@ class Client(object):
     # Models
     ####################################
 
-    def create_model(self, name, task, model_file_path, model_class, docker_image=None):
+    def create_model(self, name, task, model_file_path, model_class, 
+                        docker_image=None, access_rights=ModelAccessRights.PUBLIC):
         '''
         Creates a model on Rafiki.
 
@@ -115,7 +116,8 @@ class Client(object):
                 'name': name,
                 'task': task,
                 'docker_image': docker_image,
-                'model_class':  model_class
+                'model_class':  model_class,
+                'access_rights': access_rights
             }
         )
         return data

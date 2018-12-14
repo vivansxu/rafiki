@@ -76,24 +76,32 @@ class BaseModel(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def train(self, dataset_uri):
+    def train(self, dataset_uri, train_uris=[]):
         '''
         Train this model instance with given dataset and initialized knob values.
 
         :param str dataset_uri: URI of the train dataset in a format specified by the task
+        :param train_uris: List of uris from previous model predictions
+        :type train_uris: list[str]
         '''
         raise NotImplementedError()
 
     # TODO: Allow configuration of other metrics
     @abc.abstractmethod
-    def evaluate(self, dataset_uri):
+    def evaluate(self, dataset_uri, test_uris=[]):
         '''
         Evaluate this model instance with given dataset after training. 
         This will be called only when model is *trained*.
 
         :param str dataset_uri: URI of the test dataset in a format specified by the task
-        :returns: Accuracy as float from 0-1 on the test dataset
-        :rtype: float
+        :param test_uris: List of uris from previous model predictions
+        :type test_uris: list[str]
+        :returns: Tuple of accuracy, predictions of dataset, and the corresponding classes.
+        :rtype:
+            ::
+
+                (accuracy, predictions, classes)
+            
         '''
         raise NotImplementedError()
 

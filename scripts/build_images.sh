@@ -12,12 +12,12 @@ title()
 
 title "Building Rafiki Admin's image..."
 docker build -t $RAFIKI_IMAGE_ADMIN:$RAFIKI_VERSION -f ./dockerfiles/admin.Dockerfile $PWD || exit 1 
-title "Building Rafiki Advisor's image..."
-docker build -t $RAFIKI_IMAGE_ADVISOR:$RAFIKI_VERSION -f ./dockerfiles/advisor.Dockerfile $PWD || exit 1 
+# title "Building Rafiki Advisor's image..."
+# docker build -t $RAFIKI_IMAGE_ADVISOR:$RAFIKI_VERSION -f ./dockerfiles/advisor.Dockerfile $PWD || exit 1 
 title "Building Rafiki Worker's image..."
 docker build -t $RAFIKI_IMAGE_WORKER:$RAFIKI_VERSION -f ./dockerfiles/worker.Dockerfile $PWD || exit 1 
-title "Building Rafiki Predictor's image..."
-docker build -t $RAFIKI_IMAGE_PREDICTOR:$RAFIKI_VERSION -f ./dockerfiles/predictor.Dockerfile $PWD || exit 1 
-title "Building Rafiki Admin Web's image..."
-docker build -t $RAFIKI_IMAGE_ADMIN_WEB:$RAFIKI_VERSION -f ./dockerfiles/admin_web.Dockerfile $PWD || exit 1 
+# title "Building Rafiki Predictor's image..."
+# docker build -t $RAFIKI_IMAGE_PREDICTOR:$RAFIKI_VERSION -f ./dockerfiles/predictor.Dockerfile $PWD || exit 1 
+# title "Building Rafiki Admin Web's image..."
+# docker build -t $RAFIKI_IMAGE_ADMIN_WEB:$RAFIKI_VERSION -f ./dockerfiles/admin_web.Dockerfile $PWD || exit 1 
 echo "Finished building all Rafiki's images successfully!"

@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 import os
 
 from rafiki.constants import TrainJobStatus, \
-    TrialStatus, ServiceStatus, InferenceJobStatus
+    TrialStatus, ServiceStatus, InferenceJobStatus, ModelAccessRights
 
 from .schema import Base, TrainJob, SubTrainJob, TrainJobWorker, \
     InferenceJob, Trial, Model, User, Service, InferenceJobWorker
@@ -51,8 +51,7 @@ class Database(object):
     ####################################
 
     def create_train_job(self, user_id, app, 
-        app_version, task, train_dataset_uri, test_dataset_uri,
-        graph):
+        app_version, task, train_dataset_uri, test_dataset_uri):
 
         train_job = TrainJob(
             user_id=user_id,
@@ -60,17 +59,16 @@ class Database(object):
             app_version=app_version,
             task=task,
             train_dataset_uri=train_dataset_uri,
-            test_dataset_uri=test_dataset_uri,
-            graph=graph
+            test_dataset_uri=test_dataset_uri
         )
         self._session.add(train_job)
         return train_job
 
-    def get_uncompleted_train_jobs(self):
-        train_jobs = self._session.query(TrainJob) \
-            .filter(TrainJob.status == TrainJobStatus.STARTED).all()
+    # def get_uncompleted_train_jobs(self):
+    #     train_jobs = self._session.query(TrainJob) \
+    #         .filter(TrainJob.status == TrainJobStatus.STARTED).all()
 
-        return train_jobs
+    #     return train_jobs
 
     def get_train_jobs_of_app(self, app):
         train_jobs = self._session.query(TrainJob) \
@@ -102,17 +100,17 @@ class Database(object):
 
         return query.first()
 
-    def mark_train_job_as_running(self, train_job):
-        train_job.status = TrainJobStatus.RUNNING
-        train_job.datetime_completed = None
-        self._session.add(train_job)
-        return train_job
+    # def mark_train_job_as_running(self, train_job):
+    #     train_job.status = TrainJobStatus.RUNNING
+    #     train_job.datetime_completed = None
+    #     self._session.add(train_job)
+    #     return train_job
 
-    def mark_train_job_as_complete(self, train_job):
-        train_job.status = TrainJobStatus.COMPLETED
-        train_job.datetime_completed = datetime.datetime.utcnow()
-        self._session.add(train_job)
-        return train_job
+    # def mark_train_job_as_complete(self, train_job):
+    #     train_job.status = TrainJobStatus.COMPLETED
+    #     train_job.datetime_completed = datetime.datetime.utcnow()
+    #     self._session.add(train_job)
+    #     return train_job
 
     ####################################
     # Sub Train Job
@@ -131,15 +129,38 @@ class Database(object):
         self._session.add(sub_train_job)
         return sub_train_job
 
+    def get_sub_train_job(self, id):
+        sub_train_job = self._session.query(SubTrainJob).get(id)
+        return sub_train_job
+
+    def get_sub_train_jobs_by_train_job(self, train_job_id):
+        sub_train_jobs = self._session.query(SubTrainJob) \
+            .filter(SubTrainJob.train_job_id == train_job_id) \
+            .all()
+
+        return sub_train_jobs
+
+    def mark_sub_train_job_as_running(self, sub_train_job):
+        sub_train_job.status = TrainJobStatus.RUNNING
+        sub_train_job.datetime_completed = None
+        self._session.add(sub_train_job)
+        return sub_train_job
+
+    def mark_sub_train_job_as_complete(self, sub_train_job):
+        sub_train_job.status = TrainJobStatus.COMPLETED
+        sub_train_job.datetime_completed = datetime.datetime.utcnow()
+        self._session.add(sub_train_job)
+        return sub_train_job
+
     ####################################
     # Train Job Workers
     ####################################
 
-    def create_train_job_worker(self, service_id, train_job_id, model_id):
+    def create_train_job_worker(self, service_id, train_job_id, sub_train_job_id):
         train_job_worker = TrainJobWorker(
+            service_id=service_id,
             train_job_id=train_job_id,
-            model_id=model_id,
-            service_id=service_id
+            sub_train_job_id=sub_train_job_id
         )
         self._session.add(train_job_worker)
         return train_job_worker
@@ -148,9 +169,9 @@ class Database(object):
         train_job_worker = self._session.query(TrainJobWorker).get(service_id)
         return train_job_worker
 
-    def get_workers_of_train_job(self, train_job_id):
+    def get_workers_of_sub_train_job(self, sub_train_job_id):
         workers = self._session.query(TrainJobWorker) \
-            .filter(TrainJobWorker.train_job_id == train_job_id).all()
+            .filter(TrainJobWorker.sub_train_job_id == sub_train_job_id).all()
         return workers
 
     ####################################
@@ -304,14 +325,15 @@ class Database(object):
     # Models
     ####################################
 
-    def create_model(self, user_id, name, task, model_file_bytes, model_class, docker_image):
+    def create_model(self, user_id, name, task, model_file_bytes, model_class, docker_image, access_rights):
         model = Model(
             user_id=user_id,
             name=name,
             task=task,
             model_file_bytes=model_file_bytes,
             model_class=model_class,
-            docker_image=docker_image
+            docker_image=docker_image,
+            access_rights=access_rights
         )
         self._session.add(model)
         return model
@@ -349,11 +371,11 @@ class Database(object):
     # Trials
     ####################################
 
-    def create_trial(self, model_id, train_job_id, 
+    def create_trial(self, 
+                    sub_train_job_id,
                     knobs):
         trial = Trial(
-            model_id=model_id,
-            train_job_id=train_job_id,
+            sub_train_job_id=sub_train_job_id,
             knobs=knobs
         )
         self._session.add(trial)
@@ -361,41 +383,51 @@ class Database(object):
 
     def get_trial(self, id):
         trial = self._session.query(Trial) \
-            .join(TrainJob, Trial.train_job_id == TrainJob.id) \
+            .join(SubTrainJob, Trial.sub_train_job_id == SubTrainJob.id) \
             .filter(Trial.id == id) \
             .first()
 
         return trial
 
-    def get_best_trials_of_train_job(self, train_job_id, max_count=3):
+    def get_best_trial_of_sub_train_job(self, sub_train_job_id):
+        trial = self._session.query(Trial) \
+            .filter(Trial.sub_train_job_id == sub_train_job_id) \
+            .filter(Trial.status == TrainJobStatus.COMPLETED) \
+            .order_by(Trial.score.desc()) \
+            .first()
+
+        return trial
+
+    def get_best_trials_of_sub_train_job(self, sub_train_job_id, max_count=3):
         trials = self._session.query(Trial) \
-            .filter(Trial.train_job_id == train_job_id) \
+            .filter(Trial.sub_train_job_id == sub_train_job_id) \
             .filter(Trial.status == TrainJobStatus.COMPLETED) \
             .order_by(Trial.score.desc()) \
             .limit(max_count).all()
 
         return trials
 
-    def get_trials_of_app(self, app):
-        trials = self._session.query(Trial) \
-            .join(TrainJob, Trial.train_job_id == TrainJob.id) \
-            .filter(TrainJob.app == app) \
-            .order_by(Trial.datetime_started.desc())
+    # def get_trials_of_app(self, app):
+    #     trials = self._session.query(Trial) \
+    #         .join(TrainJob, Trial.train_job_id == TrainJob.id) \
+    #         .filter(TrainJob.app == app) \
+    #         .order_by(Trial.datetime_started.desc())
 
-        return trials
+    #     return trials
 
-    def get_trials_of_train_job(self, train_job_id):
+    def get_trials_of_sub_train_job(self, sub_train_job_id):
         trials = self._session.query(Trial) \
-            .join(TrainJob, Trial.train_job_id == TrainJob.id) \
-            .filter(TrainJob.id == train_job_id) \
+            .join(SubTrainJob, Trial.sub_train_job_id == SubTrainJob.id) \
+            .filter(SubTrainJob.id == sub_train_job_id) \
             .order_by(Trial.datetime_started.desc()).all()
 
         return trials
 
-    def get_completed_trials_of_train_job(self, train_job_id):
+    def get_completed_trials_of_sub_train_job(self, sub_train_job_id):
         trials = self._session.query(Trial) \
             .filter(Trial.status == TrainJobStatus.COMPLETED) \
-            .filter(Trial.train_job_id == train_job_id).all()
+            .filter(Trial.sub_train_job_id == sub_train_job_id) \
+            .all()
 
         return trials
 

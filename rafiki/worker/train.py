@@ -5,12 +5,13 @@ import traceback
 import pickle
 import pprint
 
-from rafiki.config import SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD
+from rafiki.config import SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, TRAIN_WORKER_CACHE_DATABASE_NUMBER
 from rafiki.constants import TrainJobStatus, TrialStatus, BudgetType
 from rafiki.utils.model import load_model_class
 from rafiki.utils.log import JobLogger
 from rafiki.model import ModelLogUtilsLogger
 from rafiki.db import Database
+from rafiki.cache import Cache
 from rafiki.client import Client
 
 logger = logging.getLogger(__name__)
@@ -21,9 +22,10 @@ class InvalidBudgetTypeException(Exception): pass
 class InvalidWorkerException(Exception): pass
 
 class TrainWorker(object):
-    def __init__(self, service_id, db=Database()):
+    def __init__(self, service_id, db=Database(), cache=Cache(db=TRAIN_WORKER_CACHE_DATABASE_NUMBER)):
         self._service_id = service_id
         self._db = db
+        self._cache = cache
         self._trial_id = None
         self._client = self._make_client()
 
@@ -34,21 +36,34 @@ class TrainWorker(object):
         advisor_id = None
         while True:
             self._db.connect()
-            (budget_type, budget_amount, model_id,
-                model_file_bytes, model_class, train_job_id, 
-                train_dataset_uri, test_dataset_uri) = self._read_worker_info()
+
+            (sub_train_job_id, budget_type, budget_amount, 
+                model_id, model_file_bytes, model_class,
+                train_job_id, train_dataset_uri, test_dataset_uri, graph) = self._read_worker_info()
 
             # Load model class from bytes
             clazz = load_model_class(model_file_bytes, model_class)
 
-            if self._if_budget_reached(budget_type, budget_amount, train_job_id, model_id):
+            if self._if_budget_reached(budget_type, budget_amount, sub_train_job_id):
                 # If budget reached
-                logger.info('Budget for train job has reached')
+                logger.info('Budget for sub train job has reached')
+
+                # Get best trial
+                (prediction_train_url, prediction_test_url) = self._get_best_trial_urls(
+                    sub_train_job_id,
+                    clazz,
+                    train_dataset_uri,
+                    test_dataset_uri
+                )
+
+                sub_train_job = self._db.get_sub_train_job(sub_train_job_id)
+                sub_train_job.prediction_train_url = prediction_train_url
+                sub_train_job.prediction_test_url = prediction_test_url
+                self._db.commit()
 
                 self._stop_worker()
                 if advisor_id is not None:
                     self._delete_advisor(advisor_id)
-
                 break
 
             # If not created, create a Rafiki advisor for train worker to propose knobs in trials
@@ -70,7 +85,7 @@ class TrainWorker(object):
             logger.info('Received proposal of knobs from advisor:')
             logger.info(pprint.pformat(knobs))
             logger.info('Creating new trial in DB...')
-            trial = self._create_new_trial(model_id, train_job_id, knobs)
+            trial = self._create_new_trial(sub_train_job_id, knobs)
             self._trial_id = trial.id
             logger.info('Created trial of ID "{}" in DB'.format(trial.id))
 
@@ -124,6 +139,25 @@ class TrainWorker(object):
             logger.error('Error marking trial as terminated:')
             logger.error(traceback.format_exc())
 
+    def _get_best_trial_urls(self, sub_train_job_id, clazz,
+                                train_dataset_uri, test_dataset_uri):
+        
+        best_trial = self._db.get_best_trial_of_sub_train_job(sub_train_job_id)
+        model_inst = clazz()
+
+        model_inst.init(best_trial.knobs)
+        parameters = pickle.loads(best_trial.parameters)
+        model_inst.load_parameters(parameters)
+
+        (train_accuracy, train_probabilities, train_classes) = model_inst.evaluate(train_dataset_uri)
+        (test_accuracy, test_probabilities, test_classes) = model_inst.evaluate(test_dataset_uri)
+        logger.info(train_accuracy)
+        logger.info(test_accuracy)
+        prediction_train_url = self._cache.add_dataset_predictions(train_probabilities, train_classes)
+        prediction_test_url = self._cache.add_dataset_predictions(test_probabilities, test_classes)
+
+        return (prediction_train_url, prediction_test_url)
+
     def _train_and_evaluate_model(self, clazz, knobs, train_dataset_uri, 
                                     test_dataset_uri):
         model_inst = clazz()
@@ -139,7 +173,7 @@ class TrainWorker(object):
         model_inst.train(train_dataset_uri)
 
         # Evaluate model
-        score = model_inst.evaluate(test_dataset_uri)
+        (score, probabilities, classes) = model_inst.evaluate(test_dataset_uri)
 
         # Dump and pickle model parameters
         parameters = model_inst.dump_parameters()
@@ -153,10 +187,9 @@ class TrainWorker(object):
         return (score, parameters, logs)
 
     # Creates a new trial in the DB
-    def _create_new_trial(self, model_id, train_job_id, knobs):
+    def _create_new_trial(self, sub_train_job_id, knobs):
         trial = self._db.create_trial(
-            model_id=model_id, 
-            train_job_id=train_job_id, 
+            sub_train_job_id=sub_train_job_id,
             knobs=knobs
         )
         self._db.commit()
@@ -200,12 +233,11 @@ class TrainWorker(object):
             logger.warning(traceback.format_exc())
 
     # Returns whether the worker reached its budget
-    def _if_budget_reached(self, budget_type, budget_amount, train_job_id, model_id):
+    def _if_budget_reached(self, budget_type, budget_amount, sub_train_job_id):
         if budget_type == BudgetType.MODEL_TRIAL_COUNT:
             max_trials = budget_amount 
-            completed_trials = self._db.get_completed_trials_of_train_job(train_job_id)
-            model_completed_trials = [x for x in completed_trials if x.model_id == model_id]
-            return len(model_completed_trials) >= max_trials
+            completed_trials = self._db.get_completed_trials_of_sub_train_job(sub_train_job_id)
+            return len(completed_trials) >= max_trials
         else:
             raise InvalidBudgetTypeException()
 
@@ -215,24 +247,27 @@ class TrainWorker(object):
         if worker is None:
             raise InvalidWorkerException()
 
-        model = self._db.get_model(worker.model_id)
         train_job = self._db.get_train_job(worker.train_job_id)
+        sub_train_job = self._db.get_sub_train_job(worker.sub_train_job_id)
+        model = self._db.get_model(sub_train_job.model_id)
 
         if model is None:
             raise InvalidModelException()
 
-        if train_job is None:
+        if train_job is None or sub_train_job is None:
             raise InvalidTrainJobException()
 
         return (
-            train_job.budget_type, 
-            train_job.budget_amount, 
-            worker.model_id,
+            sub_train_job.id,
+            sub_train_job.budget_type, 
+            sub_train_job.budget_amount,
+            model.id,
             model.model_file_bytes,
             model.model_class,
             train_job.id,
             train_job.train_dataset_uri,
-            train_job.test_dataset_uri
+            train_job.test_dataset_uri,
+            train_job.graph
         )
 
     def _make_client(self):
