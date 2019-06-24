@@ -32,21 +32,23 @@ class PG_GANs():
     @staticmethod
     def get_knob_config():
         return {
-            'minibatch_base': FixedKnob(4)
-
-            'lod_initial_resolution': FixedKnob(4)
             'D_repeats': IntegerKnob(1, 3)
+            'minibatch_base': CategoricalKnob([4, 8, 16, 32]),
+            'G_lrate': FloatKnob(1e-5, 1e-1, is_exp=True),
+            'D_lrate': FloatKnob(1e-5, 1e-1, is_exp=True),
+            'lod_initial_resolution': FixedKnob(4),
         }
 
     def __init__(self, **knobs):
         super().__init__(**knobs)
         self._knobs = knobs
+        self.num_gpus = 1
         np.random.seed(1000)
         print('Initializing TensorFlow...')
 
         tf_config = {}
         tf_config['graph_options.place_pruned_graph'] = True
-        tf_config['gpu_options.allow_growth'] = False
+        tf_config['gpu_options.allow_growth'] = True
 
         #TODO: any environment var needed?
 
@@ -56,44 +58,23 @@ class PG_GANs():
 
        
     def train(self, dataset_uri):
-        num_gpus
-
+        D_repeats = self._knobs.get('D_repeats')
+        _train_progressive_gan(num_gpus=self.num_gpus, D_repeats=D_repeats)
 
     def evaluate(self, dataset_uri):
-        dataset = dataset_utils.load_dataset_of_image_files(dataset_uri)
-        (images, classes) = zip(*[(image, image_class) for (image, image_class) in dataset])
-        X = self._prepare_X(images)
-        y = classes
-        preds = self._clf.predict(X)
-        accuracy = sum(y == preds) / len(y)
-        return accuracy
+        pass
 
     def predict(self, queries):
-        X = self._prepare_X(queries)
-        probs = self._clf.predict_proba(X)
-        return probs.tolist()
+        pass
 
     def destroy(self):
         pass
 
     def dump_parameters(self):
-        params = {}
-
-        # Save model parameters
-        clf_bytes = pickle.dumps(self._clf)
-        clf_base64 = base64.b64encode(clf_bytes).decode('utf-8')
-        params['clf_base64'] = clf_base64
-        
-        return params
+        pass
 
     def load_parameters(self, params):
-        # Load model parameters
-        clf_base64 = params.get('clf_base64', None)
-        if clf_base64 is None:
-            raise InvalidModelParamsException()
-        
-        clf_bytes = base64.b64decode(params['clf_base64'].encode('utf-8'))
-        self._clf = pickle.loads(clf_bytes)
+        pass
 
     # Creating TensorFlow Session
     def _create_session(config_dict=dict(), force_as_default=False):
@@ -124,20 +105,20 @@ class PG_GANs():
 
     # Main Training Process
     def _train_progressive_gan(
+        num_gpus                = 1,
         G_smoothing             = 0.99,
         D_repeats               = 1,
         minibatch_repeats       = 4,
         reset_opt_for_new_lod   = True,
-        total_kimg              = 15000,
+        total_kimg              = 12000,
         mirror_augment          = False,
         drange_net              = [-1, 1]):
 
         training_set = _load_dataset(data_dir=dataset_uri, {'tfrecord_dir': './'})
         with tf.device('/gpu:0'):
             print('Constructing networks...')
-            # TODO: finish config_G, config_D
-            G = Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **config_G)
-            D = Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **config_D)
+            G = Network('G', func='G_paper', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size)
+            D = Network('D', func='D_paper', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size)
             Gs = G.clone('Gs')
             Gs_update_op = Gs.setup_as_moving_average_of(G, beta=G_smoothing)
 
@@ -150,7 +131,87 @@ class PG_GANs():
             reals, labels = training_set.get_minibatch_tf()
             reals_split = tf.split(reals, num_gpus)
             labels_split = tf.split(labels, num_gpus)
-        G_opt = Optimizer(name='TrainG', learning_rate=lrate_in, **config_G_opt)    # TODO: complete config_G_opt; Optimizer
+
+        config_G_opt = {'beta1': 0.0, 'beta2': 0.99, 'epsilon': 1e-8}
+        config_D_opt = {'beta1': 0.0, 'beta2': 0.99, 'epsilon': 1e-8}
+        G_opt = Optimizer(name='TrainG', learning_rate=lrate_in, **config_G_opt)
+        D_opt = Optimizer(name='TrainD', learning_rate=lrate_in, **config_D_opt)
+
+        for gpu in range(num_gpus):
+            with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
+                G_gpu = G if gpu == 0 else G.clone(G.name + '_shadow')
+                D_gpu = D if gpu == 0 else D.clone(D.name + '_shadow')
+                lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
+                reals_gpu = _process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
+                labels_gpu = labels_split[gpu]
+                
+                with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
+                    G_loss = G_wgan_acgan(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config_G_loss)  # TODO: config_G_loss, config_D_loss
+                with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
+                    D_loss = D_wgangp_acgan(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config_D_loss)
+                G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
+                D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
+        G_train_op = G_opt.apply_updates()
+        D_train_op = D_opt.apply_updates()
+
+        print('Training...')
+
+        cur_nimg = 0
+        prev_lod = -1
+        config_sched = {}
+        config_sched['minibatch_base'] = self._knobs.get('minibatch_base')
+        config_sched['G_lrate'] = self._knobs.get('G_lrate')
+        config_sched['D_lrate'] = self._knobs.get('D_lrate')
+        config_sched['lod_initial_resolution'] = self._knobs.get('lod_initial_resolution')
+
+        while cur_nimg < total_kimg * 1000:
+            sched = TrainingSchedule(num_gpus, cur_nimg, training_set, **config_sched)
+            training_set.configure(sched.minibatch, sched.lod)
+            if reset_opt_for_new_lod:
+                if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
+                    G_opt.reset_optimizer_state()
+                    D_opt.reset_optimizer_state()
+            prev_lod = sched.lod
+
+            for repeat in range(minibatch_repeats):
+                for _ in range(D_repeats):
+                    tf.get_default_session().run([D_train_op, Gs_update_op], {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_in: sched.minibatch})
+                    cur_nimg += sched.minibatch
+                tf.get_default_session().run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
+
+    def _process_reals(x, lod, mirror_augment, drange_data, drange_net):
+        with tf.name_scope('ProcessReals'):
+            with tf.name_scope('DynamicRange'):
+                x = tf.cast(x, tf.float32)
+                x = _adjust_dynamic_range(x, drange_data, drange_net)
+            if mirror_augment:
+                with tf.name_scope('MirrorAugment'):
+                    s = tf.shape(x)
+                    mask = tf.random_uniform([s[0], 1, 1, 1], 0.0, 1.0)
+                    mask = tf.tile(mask, [1, s[1], s[2], s[3]])
+                    x = tf.where(mask < 0.5, x, tf.reverse(x, axis=[3]))
+            with tf.name_scope('FadeLOD'):
+                s = tf.shape(x)
+                y = tf.reshape(x, [-1, s[1], s[2]//2, 2, s[3]//2, 2])
+                y = tf.reduce_mean(y, axis=[3, 5], keepdims=True)
+                y = tf.tile(y, [1, 1, 1, 2, 1, 2])
+                y = tf.reshape(y, [-1, s[1], s[2], s[3]])
+                x = x + (y - x) * (lod - tf.floor(lod))
+
+            with tf.name_scope('UpscaleLOD'):
+                s = tf.shape(x)
+                factor = tf.cast(2 ** tf.floor(lod), tf.int32)
+                x = tf.reshape(x, [-1, s[1], s[2], 1, s[3], 1])
+                x = tf.tile(x, [1, 1, 1, factor, 1, factor])
+                x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
+            return x
+
+    def _adjust_dynamic_range(data, drange_in, drange_out):
+        if drange_in != drange_out:
+            scale = (np.float32(drange_out[1]) - np.float32(drange_out[0])) / (np.float32(drange_in[1]) - np.float32(drange_in[0]))
+            bias = (np.float32(drange_out[0]) - np.float32(drange_in[0]) * scale)
+            data = data * scale + bias
+        return data
 
 # Dataset Class for tfrecords files
 class TFRecordDataset:
@@ -656,6 +717,7 @@ class Network:
         labels_out = tf.identify(combo_out[:, 1:], name='labels_out')
         return scores_out, labels_out
 
+
     # same as tf.nn.leaky_relu, but supports FP16
     def _leaky_relu(self, x, alpha=0.2):
         with tf.name_scope('LeakyRelu'):
@@ -763,6 +825,252 @@ class Network:
     def _lerp(self, a, b, t):
         return a + (b - a) * t
 
+class Optimizer:
+    def __init__(
+        self,
+        name                = 'Train',
+        tf_optimizer        = 'tf.train.AdamOptimizer',
+        learning_rate       = 0.001,
+        use_loss_scaling    = False,
+        loss_scaling_init   = 64.0,
+        loss_scaling_inc    = 0.0005,
+        loss_scaling_dec    = 1.0,
+        **kwargs):
+
+        self.name = name
+        self.learning_rate = tf.convert_to_tensor(learning_rate)
+        self.id = self.name.replace('/', '.')
+        self.scope = tf.get_default_graph().unique_name(self.id)
+        self.optimizer_class = import_obj(tf_optimizer)
+        self.optimizer_kwargs = dict(kwargs)
+        self.use_loss_scaling = use_loss_scaling
+        self.loss_scaling_init = loss_scaling_init
+        self.loss_scaling_inc = loss_scaling_inc
+        self.loss_scaling_dec = loss_scaling_dec
+        self._grad_shapes = None
+        self._dev_opt = OrderedDict()
+        self._dev_grads = OrderedDict()
+        self._dev_ls_var = OrderedDict()
+        self._updates_applied = False
+
+    def register_gradients(self, loss, vars):
+        assert not self._updates_applied
+
+        if isinstance(vars, dict):
+            vars = list(vars.values())
+        assert isinstance(vars, list) and len(vars) >= 1
+        assert all((isinstance(expr, tf.Tensor) or isinstance(expr, tf.Variable) or isinstance(expr, tf.Operation)) for expr in vars + [loss])
+        if self._grad_shapes is None:
+            self._grad_shapes = [[dim.value for dim in var.shape] for var in vars]
+        assert len(vars) == len(self._grad_shapes)
+        assert all([dim.value for dim in var.shape] == var_shape for var, var_shape in zip(vars, self._grad_shapes))
+        dev = loss.device
+        assert all(var.device == dev for var in vars)
+
+        with tf.name_scope(self.id + '_grad'), tf.device(dev):
+            if dev not in self._dev_opt:
+                opt_name = self.scope.replace('/', '_') + '_opt%d' % len(self._dev_opt)
+                self._dev_opt[dev] = self.optimizer_class(name=opt_name, learning_rate=self.learning_rate, **self.optimizer_kwargs)
+                self._dev_grads[dev] = []
+            loss = self.apply_loss_scaling(tf.cast(loss, tf.float32))
+            grads = self._dev_opt[dev].compute_gradients(loss, vars, gate_gradients=tf.train.Optimizer.GATE_NONE)
+            grads = [(g, v) if g is not None else (tf.zeros_like(v), v) for g, v in grads]
+            self._dev_grads[dev].append(grads)
+
+    def apply_updates(self):
+        assert not self._updates_applied
+        self._updates_applied = True
+        devices = list(self._dev_grads.keys())
+        total_grads = sum(len(grads) for grads in self._dev_grads.values())
+        assert len(devices) >= 1 and total_grads >= 1
+        ops = []
+        with tf.name_scope(self.scope + '/'):
+            dev_grads = OrderedDict()
+            for dev_idx, dev in enumerate(devices):
+                with tf.name_scope('ProcessGrads%d' % dev_idx), tf.device(dev):
+                    sums = []
+                    for gv in zip(*self._dev_grads[dev]):
+                        assert all(v is gv[0][1] for g, v in gv)
+                        g = [tf.cast(g, tf.float32) for g, v in gv]
+                        g = g[0] if len(g) == 1 else tf.add_n(g)
+                        sums.append((g, gv[0][1]))
+                    dev_grads[dev] = sums
+            
+            if len(devices) > 1:
+                with tf.name_scope('SumAcrossGPUs'), tf.device(None):
+                    for var_idx, grad_shape in enumerate(self._grad_shapes):
+                        g = [dev_grads[dev][var_idx][0] for dev in devices]
+                        if np.prod(grad_shape): # nccl does not support zero-sized tensors
+                            g = tf.contrib.nccl.all_sum(g)
+                        for dev, gg in zip(devices, g):
+                            dev_grads[dev][var_idx] = (gg, dev_grads[dev][var_idx][1])
+
+            for dev_idx, (dev, grads) in enumerate(dev_grads.items()):
+                with tf.name_scope('ApplyGrads%d' % dev_idx), tf.device(dev):
+                    if self.use_loss_scaling or total_grads > 1:
+                        with tf.name_scope('Scale'):
+                            coef = tf.constant(np.float32(1.0 / total_grads), name='coef')
+                            coef = self.undo_loss_scaling(coef)
+                            grads = [(g * coef, v) for g, v in grads]
+                    with tf.name_scope('CheckOverflow'):
+                        grad_ok = tf.reduce_all(tf.stack([tf.reduce_all(tf.is_finite(g)) for g, v in grads]))
+
+                    with tf.name_scope('UpdateWeights'):
+                        opt = self._dev_opt[dev]
+                        ls_var = self.get_loss_scaling_var(dev)
+                        if not self.use_loss_scaling:
+                            ops.append(tf.cond(grad_ok, lambda: opt.apply_gradients(grads), tf.no_op))
+                        else:
+                            ops.append(tf.cond(grad_ok,
+                                lambda: tf.group(tf.assign_add(ls_var, self.loss_scaling_inc), opt.apply_gradients(grads)),
+                                lambda: tf.group(tf.assign_sub(ls_var, self.loss_scaling_dec))))
+
+                    if dev == devices[-1]:
+                        with tf.name_scope('Statistics'):
+                            ops.append(_autosummary(self.id + '/learning_rate', self.learning_rate))
+                            ops.append(_autosummary(self.id + '/overflow_frequency', tf.where(grad_ok, 0, 1)))
+                            if self.use_loss_scaling:
+                                ops.append(_autosummary(self.id + '/loss_scaling_log2', ls_var))
+
+            self.reset_optimizer_state()
+            init_uninited_vars(list(self._dev_ls_var.values()))
+            return tf.group(*ops, name='TrainingOp')
+
+    def reset_optimizer_state(self):
+        tf.get_default_session().run([var.initializer for opt in self._dev_opt.values() for var in opt.variables()])
+
+    def get_loss_scaling_var(self, device):
+        if not self.use_loss_scaling:
+            return None
+        if device not in self._dev_ls_var:
+            with tf.name_scope(self.scope + '/LossScalingVars/'), tf.control_dependencies(None):
+                self._dev_ls_var[device] = tf.Variable(np.float32(self.loss_scaling_init), name='loss_scaling_var')
+        return self._dev_ls_var[device]
+
+    def apply_loss_scaling(self, value):
+        assert isinstance(value, tf.Tensor) or isinstance(value, tf.Variable) or isinstance(value, tf.Operation)
+        if not self.use_loss_scaling:
+            return value
+        return value * exp2(self.get_loss_scaling_var(value.device))
+
+    def undo_loss_scaling(self, value):
+        assert isinstance(value, tf.Tensor) or isinstance(value, tf.Variable) or isinstance(value, tf.Operation)
+        if not self.use_loss_scaling:
+            return value
+        return value * exp2(-self.get_loss_scaling_var(value.device))
+        
+class TrainingSchedule:
+    def __init__(self,
+        num_gpus                = 1,
+        cur_nimg,
+        training_set,
+        lod_initial_resolution  = 4,
+        lod_training_kimg       = 600,
+        lod_transition_kimg     = 600,
+        minibatch_base          = 16,
+        minibatch_dict          = {},
+        max_minibatch_per_gpu   = {256: 16, 512: 8, 1024: 4},
+        G_lrate                 = 0.001,
+        #G_lrate_dict            = {},
+        D_lrate                 = 0.001,
+        #D_lrate_dict            = {},
+        ):
+
+        if minibatch_base == 4:
+            minibatch_dict = {4: 128, 8: 128, 16: 128, 32: 64, 64: 32, 128: 16, 256: 8, 512: 4}
+        elif minibatch_base == 8:
+            minibatch_dict = {4: 256, 8: 256, 16: 128, 32: 64, 64: 32, 128: 16, 256: 8}
+        elif minibatch_base == 16:
+            minibatch_dict = {4: 512, 8: 256, 16: 128, 32: 64, 64: 32, 128: 16}
+        elif minibatch_base == 32:
+            minibatch_dict = {4: 512, 8: 256, 16: 128, 32: 64, 64: 32}
+
+        self.kimg = cur_nimg / 1000.0
+        phase_dur = lod_training_kimg + lod_transition_kimg
+        phase_idx = int(np.floor(self.kimg / phase_dur)) if phase_dur > 0 else 0
+        phase_kimg = self.kimg - phase_idx * phase_dur
+
+        self.lod = training_set.resolution_log2
+        self.lod -= np.floor(np.log2(lod_initial_resolution))
+        self.lod -= phase_idx
+        if lod_transition_kimg > 0:
+            self.lod -= max(phase_kimg - lod_training_kimg, 0.0) / lod_transition_kimg
+        self.lod = max(self.lod, 0.0)
+        self.resolution = 2 ** (training_set.resolution_log2 - int(np.floor(self.lod)))
+
+        self.minibatch = minibatch_dict.get(self.resolution, minibatch_base)
+        self.minibatch -= self.minibatch % num_gpus
+        if self.resolution in max_minibatch_per_gpu:
+            self.minibatch = min(self.minibatch, max_minibatch_per_gpu[self.resolution] * num_gpus)
+        
+        #self.G_lrate = G_lrate_dict.get(self.resolution, G_lrate_base)
+        #self.D_lrate = D_lrate_dict.get(self.resolution, D_lrate_base)
+        self.G_lrate = G_lrate
+        self.D_lrate = D_lrate
+
+def G_wgan_acgan(G, D, opt, training_set, minibatch_size, cond_weight = 1.0):
+
+    latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
+    labels = training_set.get_random_labels_tf(minibatch_size)
+    fake_images_out = G.get_output_for(latents, labels, is_training=True)
+    fake_scores_out, fake_labels_out = fp32(D.get_output_for(fake_images_out, is_training=True))
+    loss = -fake_scores_out
+
+    if D.output_shapes[1][1] > 0:
+        with tf.name_scope('LabelPenalty'):
+            label_penalty_fakes = tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=fake_labels_out)
+        loss += label_penalty_fakes * cond_weight
+
+    return loss
+
+def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
+    wgan_lambda = 10.0,
+    wgan_epsilon = 0.001,
+    wgan_target = 1.0,
+    cond_weight = 1.0):
+
+    latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
+    fake_images_out = G.get_output_for(latents, labels, is_training=True)
+    real_scores_out, real_labels_out = fp32(D.get_output_for(reals, is_training=True))
+    fake_scores_out, fake_labels_out = fp32(D.get_output_for(fake_images_out, is_training=True))
+    real_scores_out = _autosummary('Loss/real_scores', real_scores_out)
+    fake_scores_out = _autosummary('Loss/fake_scores', fake_scores_out)
+    loss = fake_scores_out - real_scores_out
+
+    with tf.name_scope('GradientPenalty'):
+        mixing_factors = tf.random_uniform([minibatch_size, 1, 1, 1], 0.0, 1.0, dtype=fake_images_out.dtype)
+        mixed_images_out = tf.cast(reals, fake_images_out.dtype) + (fake_images_out - tf.cast(reals, fake_images_out.dtype)) * mixing_factors
+        mixed_scores_out, mixed_labels_out = fp32(D.get_output_for(mixed_images_out, is_training=True))
+        mixed_scores_out = _autosummary('Loss/mixed_scores', mixed_scores_out)
+        mixed_loss = opt.apply_loss_scaling(tf.reduce_sum(mixed_scores_out))
+        mixed_grads = opt.undo_loss_scaling(fp32(tf.gradients(mixed_loss, [mixed_images_out])[0]))
+        mixed_norms = tf.sqrt(tf.reduce_sum(tf.square(mixed_grads), axis=[1,2,3]))
+        mixed_norms = _autosummary('Loss/mixed_norms', mixed_norms)
+        gradient_penalty = tf.square(mixed_norms - wgan_target)
+    loss += gradient_penalty * (wgan_lambda / (wgan_target**2))
+
+    with tf.name_scope('EpsilonPenalty'):
+        epsilon_penalty = _autosummary('Loss/epsilon_penalty', tf.square(real_scores_out))
+    loss += epsilon_penalty * wgan_epsilon
+
+    if D.output_shapes[1][1] > 0:
+        with tf.name_scope('LabelPenalty'):
+            label_penalty_reals = tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=real_labels_out)
+            label_penalty_fakes = tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=fake_labels_out)
+            label_penalty_reals = _autosummary('Loss/label_penalty_reals', label_penalty_reals)
+            label_penalty_fakes = _autosummary('Loss/label_penalty_fakes', label_penalty_fakes)
+        loss += (label_penalty_reals + label_penalty_fakes) * cond_weight
+    return loss
+
+def fp32(*values):
+    if len(values) == 1 and isinstance(values[0], tuple):
+        values = values[0]
+    values = tuple(tf.cast(v, tf.float32) for v in values)
+    return values if len(values) >= 2 else values[0]
+
+def exp2(x):
+    with tf.name_scope('Exp2'):
+        return tf.exp(x * np.float32(np.log(2.0)))
 
 def _set_vars(var_to_value_dict):
     ops = []
@@ -778,6 +1086,84 @@ def _set_vars(var_to_value_dict):
         ops.append(setter)
         feed_dict[setter.op.inputs[1]] = value
     tf.get_default_session().run(ops, feed_dict)
+
+def init_uninited_vars(vars=None):
+    if vars is None: vars = tf.global_variables()
+    test_vars = []; test_ops = []
+    with tf.control_dependencies(None): # ignore surrounding control_dependencies
+        for var in vars:
+            assert is_tf_expression(var)
+            try:
+                tf.get_default_graph().get_tensor_by_name(var.name.replace(':0', '/IsVariableInitialized:0'))
+            except KeyError:
+                # Op does not exist => variable may be uninitialized.
+                test_vars.append(var)
+                with absolute_name_scope(var.name.split(':')[0]):
+                    test_ops.append(tf.is_variable_initialized(var))
+    init_vars = [var for var, inited in zip(test_vars, run(test_ops)) if not inited]
+    run([var.initializer for var in init_vars]
+
+def import_module(module_or_obj_name):
+    parts = module_or_obj_name.split('.')
+    parts[0] = {'np': 'numpy', 'tf': 'tensorflow'}.get(parts[0], parts[0])
+    for i in range(len(parts), 0, -1):
+        try:
+            module = importlib.import_module('.'.join(parts[:i]))
+            relative_obj_name = '.'.join(parts[i:])
+            return module, relative_obj_name
+        except ImportError:
+            pass
+    raise ImportError(module_or_obj_name)
+
+def find_obj_in_module(module, relative_obj_name):
+    obj = module
+    for part in relative_obj_name.split('.'):
+        obj = getattr(obj, part)
+    return obj
+
+def import_obj(obj_name):
+    module, relative_obj_name = import_module(obj_name)
+    return find_obj_in_module(module, relative_obj_name)
+
+_autosummary_vars = OrderedDict() # name => [var, ...]
+_autosummary_immediate = OrderedDict() # name => update_op, update_value
+_autosummary_finalized = False
+
+def _autosummary(name, value):
+    id = name.replace('/', '_')
+    if isinstance(value, tf.Tensor) or isinstance(value, tf.Variable) or isinstance(value, tf.Operation):
+        with tf.name_scope('summary_' + id), tf.device(value.device):
+            update_op = _create_autosummary_var(name, value)
+            with tf.control_dependencies([update_op]):
+                return tf.identity(value)
+    else: # python scalar or numpy array
+        if name not in _autosummary_immediate:
+            with tf.name_scope('Autosummary/' + id + '/'), tf.device(None), tf.control_dependencies(None):
+                update_value = tf.placeholder(tf.float32)
+                update_op = _create_autosummary_var(name, update_value)
+                _autosummary_immediate[name] = update_op, update_value
+        update_op, update_value = _autosummary_immediate[name]
+        tf.get_default_session().run(update_op, {update_value: np.float32(value)})
+        return value
+
+def _create_autosummary_var(name, value_expr):
+    assert not _autosummary_finalized
+    v = tf.cast(value_expr, tf.float32)
+    if v.shape.ndims is 0:
+        v = [v, np.float32(1.0)]
+    elif v.shape.ndims is 1:
+        v = [tf.reduce_sum(v), tf.cast(tf.shape(v)[0], tf.float32)]
+    else:
+        v = [tf.reduce_sum(v), tf.reduce_prod(tf.cast(tf.shape(v), tf.float32))]
+    v = tf.cond(tf.is_finite(v[0]), lambda: tf.stack(v), lambda: tf.zeros(2))
+    with tf.control_dependencies(None):
+        var = tf.Variable(tf.zeros(2)) # [numerator, denominator]
+    update_op = tf.cond(tf.is_variable_initialized(var), lambda: tf.assign_add(var, v), lambda: tf.assign(var, v))
+    if name in _autosummary_vars:
+        _autosummary_vars[name].append(var)
+    else:
+        _autosummary_vars[name] = [var]
+    return update_op
 
 if __name__ == '__main__':
     '''test_model_class(
