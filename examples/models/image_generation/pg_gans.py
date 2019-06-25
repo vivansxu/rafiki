@@ -4,21 +4,28 @@ import numpy as np
 import tensorflow as tf
 import glob
 import sys
-import argparse
-import threading
-import six.moves.queue as Queue
-import traceback
+#import argparse
+#import threading
+from six.moves import urllib
+#import traceback
 from PIL import Image
 import inspect
 import importlib
-import imp
+#import imp
 from collections import OrderedDict
-import re
-import datetime
-import time
-import bisect
-import scipy.ndimage
+import tarfile
+import math
+#import re
+#import datetime
+#import time
+#import bisect
+#import scipy.ndimage
 import scipy.misc
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 
 from rafiki.model import BaseModel, InvalidModelParamsException, test_model_class, \
                         IntegerKnob, CategoricalKnob, dataset_utils, logger
@@ -59,22 +66,148 @@ class PG_GANs():
        
     def train(self, dataset_uri):
         D_repeats = self._knobs.get('D_repeats')
-        _train_progressive_gan(num_gpus=self.num_gpus, D_repeats=D_repeats)
+        _train_progressive_gan(dataset_uri=dataset_uri, num_gpus=self.num_gpus, D_repeats=D_repeats)
 
     def evaluate(self, dataset_uri):
-        pass
+        MODEL_DIR = '/tmp/imagenet'
+        DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
+        softmax = None
+
+        if not os.path.exists(MODEL_DIR):
+            os.makedirs(MODEL_DIR)
+        filename = DATA_URL.split('/')[-1]
+        filepath = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(filepath):
+            def _progress(count, block_size, total_size):
+                sys.stdout.write('\r>> Downloading %s %.1f%%' % (filename, float(count * block_size) / float(total_size) * 100.0))
+                sys.stdout.flush()
+            filepath, _ = urllib.request.urlretrieve(DATA_URL, filepath, _progress)
+            print()
+            statinfo = os.stat(filepath)
+            print('Successfully download', filename, statinfo.st_size, 'bytes.')
+            tarfile.open(filepath, 'r:gz').extractall(MODEL_DIR)
+        with tf.gfile.FastGFile(os.path.join(MODEL_DIR, 'classify_image_graph_def.pb'), 'rb') as f:
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(f.read())
+            _ = tf.import_graph_def(graph_def, name='')
+
+        with tf.Session() as sess:
+            pool3 = sess.graph.get_tensor_by_name('pool_3:0')
+            ops = pool3.graph.get_operations()
+            for op_idx, op in enumerate(ops):
+                for o in op.outputs:
+                    shape = o.get_shape()
+                    shape = [s.value for s in shape]
+                    new_shape = []
+                    for j, s in enumerate(shape):
+                        if s == 1 and j == 0:
+                            new_shape.append(None)
+                        else:
+                            new_shape.append(s)
+                    try:
+                        o._shape = tf.TensorShape(new_shape)
+                    except ValueError:
+                        o._shape_val = tf.TensorShape(new_shape)
+
+            w = sess.graph.get_operation_by_name("softmax/logits/MatMul").inputs[1]
+            logits = tf.matmul(tf.squeeze(pool3, [1, 2]), w)
+            softmax = tf.nn.softmax(logits)
+
+        #-------------------------------------------------------------
+
+        minibatch_size = np.clip(8192 // self.training_set.shape[1], 4, 256)
+        images = []
+
+        for begin in range(0, 10000, minibatch_size):
+            end = min(begin + minibatch_size, 10000)
+            latents = np.random.randn(end - begin, *self.Gs.input_shape[1:]).astype(np.float32)
+            labels = np.zeros([latents.shape[0], 0], np.float32)
+            imgs = self.Gs.run(latents, labels, num_gpus=self.num_gpus, out_mul=127.5, out_add=127.5, out_dtype=np.uint8)
+            if imgs.shape[1] == 1:
+                imgs = np.tile(imgs, [1, 3, 1, 1])
+            images.append(imgs.transpose(0, 2, 3, 1))
+
+        images = list(np.concatenate(images))
+
+        assert(type(images) == list)
+        assert(type(images[0]) == np.ndarray)
+        assert(len(images[0].shape) == 3)
+
+        inps = []
+        for img in images:
+            img = img.astype(np.float32)
+            inps.append(np.expand_dims(img, 0))
+        bs = 100
+        with tf.Session() as sess:
+            preds = []
+            n_batches = int(math.ceil(float(len(inps)) / float(bs)))
+            for i in range(n_batches):
+                inp = inps[(i * bs):min((i + 1) * bs, len(inps))]
+                inp = np.concatenate(inp, 0)
+                pred = sess.run(softmax, {'ExpandDims:0': inp})
+                preds.append(pred)
+            preds = np.concatenate(preds, 0)
+            scores = []
+            for i in range(10):
+                part = preds[(i * preds.shape[0] // 10):((i + 1) * preds.shape[0] // 10), :]
+                kl = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
+                kl = np.mean(np.sum(kl, 1))
+                scores.append(np.exp(kl))
+            
+            return np.mean(scores)
 
     def predict(self, queries):
-        pass
+        random_state = np.random.RandomState(1000)
+        grid_size = [queries[0], queries[1]]
+        num_images = queries[2]
+        list_imgs = []
+        for idx in range(num_images):
+            print('Generating image %d / %d' % (idx, num_images))
+            latents = random_state.randn(np.prod(grid_size), *self.Gs.input_shape[1:]).astype(np.float32)
+            labels = np.zeros([latents.shape[0], 0], np.float32)
+            images = self.Gs.run(latents, labels, minibatch_size=8, num_gpus=self.num_gpus, out_mul=127.5, out_add=127.5, out_shrink=1, out_dtype=np.uint8)
+            
+            assert images.ndim == 3 or images.ndim == 4
+            num, img_w, img_h = images.shape[0], images.shape[-1], images.shape[-2]
+
+            grid_w = max(int(np.ceil(np.sqrt(num))), 1)
+            grid_h = max((num - 1) // grid_w + 1, 1)
+
+            grid = np.zeros(list(images.shape[1:-2]) + [grid_h * img_h, grid_w * img_w], dtype=images.dtype)
+
+            for idx in range(num):
+                x = (idx % grid_w) * img_w
+                y = (idx // grid_w) * img_h
+                grid[..., y : y + img_h, x : x + img_w] = images[idx]
+            
+            assert grid.ndim == 2 or grid.ndim == 3
+            if grid.ndim == 3:
+                if grid.shape[0] == 1:
+                    grid = grid[0]
+                else:
+                    grid = grid.transpose(1, 2, 0)
+
+            grid = np.rint(grid).clip(0, 255).astype(np.uint8)
+            format = 'RGB' if grid.ndim == 3 else 'L'
+
+            list_imgs.append(Image.fromarray(grid, format))
+
+        return list_imgs
 
     def destroy(self):
-        pass
+        self._session.close()
 
     def dump_parameters(self):
-        pass
+        param = {}
+        param['G'] = pickle.dump(self.G, protocol=pickle.HIGHEST_PROTOCOL)
+        param['D'] = pickle.dump(self.D, protocol=pickle.HIGHEST_PROTOCOL)
+        param['Gs'] = pickle.dump(self.Gs, protocol=pickle.HIGHEST_PROTOCOL)
+        return param
 
     def load_parameters(self, params):
-        pass
+        self.G = pickle.load(param['G'], encoding='latin1')
+        self.D = pickle.load(param['D'], encoding='latin1')
+        self.Gs = pickle.load(param['Gs'], encoding='latin1')
 
     # Creating TensorFlow Session
     def _create_session(config_dict=dict(), force_as_default=False):
@@ -104,7 +237,7 @@ class PG_GANs():
         return dataset
 
     # Main Training Process
-    def _train_progressive_gan(
+    def _train_progressive_gan(dataset_uri,
         num_gpus                = 1,
         G_smoothing             = 0.99,
         D_repeats               = 1,
@@ -114,13 +247,13 @@ class PG_GANs():
         mirror_augment          = False,
         drange_net              = [-1, 1]):
 
-        training_set = _load_dataset(data_dir=dataset_uri, {'tfrecord_dir': './'})
+        self.training_set = _load_dataset(data_dir=dataset_uri, {'tfrecord_dir': './'})
         with tf.device('/gpu:0'):
             print('Constructing networks...')
-            G = Network('G', func='G_paper', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size)
-            D = Network('D', func='D_paper', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size)
-            Gs = G.clone('Gs')
-            Gs_update_op = Gs.setup_as_moving_average_of(G, beta=G_smoothing)
+            self.G = Network('G', func='G_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
+            self.D = Network('D', func='D_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
+            self.Gs = self.G.clone('Gs')
+            Gs_update_op = self.Gs.setup_as_moving_average_of(self.G, beta=G_smoothing)
 
         print('Building TensorFlow graph...')
         with tf.name_scope('Inputs'):
@@ -128,7 +261,7 @@ class PG_GANs():
             lrate_in = tf.placeholder(tf.float32, name='lrate_in', shape=[])
             minibatch_in = tf.placeholder(tf.int32, name='minibatch_in', shape=[])
             minibatch_split = minibatch_in / num_gpus       # TODO: enter num_gpus
-            reals, labels = training_set.get_minibatch_tf()
+            reals, labels = self.training_set.get_minibatch_tf()
             reals_split = tf.split(reals, num_gpus)
             labels_split = tf.split(labels, num_gpus)
 
@@ -139,16 +272,16 @@ class PG_GANs():
 
         for gpu in range(num_gpus):
             with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
-                G_gpu = G if gpu == 0 else G.clone(G.name + '_shadow')
-                D_gpu = D if gpu == 0 else D.clone(D.name + '_shadow')
+                G_gpu = self.G if gpu == 0 else self.G.clone(self.G.name + '_shadow')
+                D_gpu = self.D if gpu == 0 else self.D.clone(self.D.name + '_shadow')
                 lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
-                reals_gpu = _process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
+                reals_gpu = _process_reals(reals_split[gpu], lod_in, mirror_augment, self.training_set.dynamic_range, drange_net)
                 labels_gpu = labels_split[gpu]
                 
                 with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
-                    G_loss = G_wgan_acgan(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config_G_loss)  # TODO: config_G_loss, config_D_loss
+                    G_loss = _G_wgan_acgan(G=G_gpu, D=D_gpu, opt=G_opt, training_set=self.training_set, minibatch_size=minibatch_split, **config_G_loss)  # TODO: config_G_loss, config_D_loss
                 with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
-                    D_loss = D_wgangp_acgan(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config_D_loss)
+                    D_loss = _D_wgangp_acgan(G=G_gpu, D=D_gpu, opt=D_opt, training_set=self.training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config_D_loss)
                 G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
                 D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
         G_train_op = G_opt.apply_updates()
@@ -165,8 +298,8 @@ class PG_GANs():
         config_sched['lod_initial_resolution'] = self._knobs.get('lod_initial_resolution')
 
         while cur_nimg < total_kimg * 1000:
-            sched = TrainingSchedule(num_gpus, cur_nimg, training_set, **config_sched)
-            training_set.configure(sched.minibatch, sched.lod)
+            sched = TrainingSchedule(num_gpus, cur_nimg, self.training_set, **config_sched)
+            self.training_set.configure(sched.minibatch, sched.lod)
             if reset_opt_for_new_lod:
                 if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
                     G_opt.reset_optimizer_state()
@@ -429,7 +562,6 @@ class Network:
         self.output_shape = self.output_shapes[0]
         self.vars = OrderedDict([(self.get_var_localname(var), var) for var in tf.global_variables(self.scope + '/')])
         self.trainables = OrderedDict([(self.get_var_localname(var), var) for var in tf.trainable_variables(self.scope + '/')])
-
 
     def reset_vars(self):
         run([var.initializer for var in self.vars.values()])
@@ -841,7 +973,7 @@ class Optimizer:
         self.learning_rate = tf.convert_to_tensor(learning_rate)
         self.id = self.name.replace('/', '.')
         self.scope = tf.get_default_graph().unique_name(self.id)
-        self.optimizer_class = import_obj(tf_optimizer)
+        self.optimizer_class = _import_obj(tf_optimizer)
         self.optimizer_kwargs = dict(kwargs)
         self.use_loss_scaling = use_loss_scaling
         self.loss_scaling_init = loss_scaling_init
@@ -933,7 +1065,7 @@ class Optimizer:
                                 ops.append(_autosummary(self.id + '/loss_scaling_log2', ls_var))
 
             self.reset_optimizer_state()
-            init_uninited_vars(list(self._dev_ls_var.values()))
+            _init_uninited_vars(list(self._dev_ls_var.values()))
             return tf.group(*ops, name='TrainingOp')
 
     def reset_optimizer_state(self):
@@ -951,13 +1083,13 @@ class Optimizer:
         assert isinstance(value, tf.Tensor) or isinstance(value, tf.Variable) or isinstance(value, tf.Operation)
         if not self.use_loss_scaling:
             return value
-        return value * exp2(self.get_loss_scaling_var(value.device))
+        return value * _exp2(self.get_loss_scaling_var(value.device))
 
     def undo_loss_scaling(self, value):
         assert isinstance(value, tf.Tensor) or isinstance(value, tf.Variable) or isinstance(value, tf.Operation)
         if not self.use_loss_scaling:
             return value
-        return value * exp2(-self.get_loss_scaling_var(value.device))
+        return value * _exp2(-self.get_loss_scaling_var(value.device))
         
 class TrainingSchedule:
     def __init__(self,
@@ -1008,12 +1140,12 @@ class TrainingSchedule:
         self.G_lrate = G_lrate
         self.D_lrate = D_lrate
 
-def G_wgan_acgan(G, D, opt, training_set, minibatch_size, cond_weight = 1.0):
+def _G_wgan_acgan(G, D, opt, training_set, minibatch_size, cond_weight = 1.0):
 
     latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
     labels = training_set.get_random_labels_tf(minibatch_size)
     fake_images_out = G.get_output_for(latents, labels, is_training=True)
-    fake_scores_out, fake_labels_out = fp32(D.get_output_for(fake_images_out, is_training=True))
+    fake_scores_out, fake_labels_out = _fp32(D.get_output_for(fake_images_out, is_training=True))
     loss = -fake_scores_out
 
     if D.output_shapes[1][1] > 0:
@@ -1023,7 +1155,7 @@ def G_wgan_acgan(G, D, opt, training_set, minibatch_size, cond_weight = 1.0):
 
     return loss
 
-def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
+def _D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
     wgan_lambda = 10.0,
     wgan_epsilon = 0.001,
     wgan_target = 1.0,
@@ -1031,8 +1163,8 @@ def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
 
     latents = tf.random_normal([minibatch_size] + G.input_shapes[0][1:])
     fake_images_out = G.get_output_for(latents, labels, is_training=True)
-    real_scores_out, real_labels_out = fp32(D.get_output_for(reals, is_training=True))
-    fake_scores_out, fake_labels_out = fp32(D.get_output_for(fake_images_out, is_training=True))
+    real_scores_out, real_labels_out = _fp32(D.get_output_for(reals, is_training=True))
+    fake_scores_out, fake_labels_out = _fp32(D.get_output_for(fake_images_out, is_training=True))
     real_scores_out = _autosummary('Loss/real_scores', real_scores_out)
     fake_scores_out = _autosummary('Loss/fake_scores', fake_scores_out)
     loss = fake_scores_out - real_scores_out
@@ -1040,10 +1172,10 @@ def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
     with tf.name_scope('GradientPenalty'):
         mixing_factors = tf.random_uniform([minibatch_size, 1, 1, 1], 0.0, 1.0, dtype=fake_images_out.dtype)
         mixed_images_out = tf.cast(reals, fake_images_out.dtype) + (fake_images_out - tf.cast(reals, fake_images_out.dtype)) * mixing_factors
-        mixed_scores_out, mixed_labels_out = fp32(D.get_output_for(mixed_images_out, is_training=True))
+        mixed_scores_out, mixed_labels_out = _fp32(D.get_output_for(mixed_images_out, is_training=True))
         mixed_scores_out = _autosummary('Loss/mixed_scores', mixed_scores_out)
         mixed_loss = opt.apply_loss_scaling(tf.reduce_sum(mixed_scores_out))
-        mixed_grads = opt.undo_loss_scaling(fp32(tf.gradients(mixed_loss, [mixed_images_out])[0]))
+        mixed_grads = opt.undo_loss_scaling(_fp32(tf.gradients(mixed_loss, [mixed_images_out])[0]))
         mixed_norms = tf.sqrt(tf.reduce_sum(tf.square(mixed_grads), axis=[1,2,3]))
         mixed_norms = _autosummary('Loss/mixed_norms', mixed_norms)
         gradient_penalty = tf.square(mixed_norms - wgan_target)
@@ -1062,13 +1194,13 @@ def D_wgangp_acgan(G, D, opt, training_set, minibatch_size, reals, labels,
         loss += (label_penalty_reals + label_penalty_fakes) * cond_weight
     return loss
 
-def fp32(*values):
+def _fp32(*values):
     if len(values) == 1 and isinstance(values[0], tuple):
         values = values[0]
     values = tuple(tf.cast(v, tf.float32) for v in values)
     return values if len(values) >= 2 else values[0]
 
-def exp2(x):
+def _exp2(x):
     with tf.name_scope('Exp2'):
         return tf.exp(x * np.float32(np.log(2.0)))
 
@@ -1087,7 +1219,7 @@ def _set_vars(var_to_value_dict):
         feed_dict[setter.op.inputs[1]] = value
     tf.get_default_session().run(ops, feed_dict)
 
-def init_uninited_vars(vars=None):
+def _init_uninited_vars(vars=None):
     if vars is None: vars = tf.global_variables()
     test_vars = []; test_ops = []
     with tf.control_dependencies(None): # ignore surrounding control_dependencies
@@ -1103,7 +1235,7 @@ def init_uninited_vars(vars=None):
     init_vars = [var for var, inited in zip(test_vars, run(test_ops)) if not inited]
     run([var.initializer for var in init_vars]
 
-def import_module(module_or_obj_name):
+def _import_module(module_or_obj_name):
     parts = module_or_obj_name.split('.')
     parts[0] = {'np': 'numpy', 'tf': 'tensorflow'}.get(parts[0], parts[0])
     for i in range(len(parts), 0, -1):
@@ -1115,15 +1247,15 @@ def import_module(module_or_obj_name):
             pass
     raise ImportError(module_or_obj_name)
 
-def find_obj_in_module(module, relative_obj_name):
+def _find_obj_in_module(module, relative_obj_name):
     obj = module
     for part in relative_obj_name.split('.'):
         obj = getattr(obj, part)
     return obj
 
-def import_obj(obj_name):
-    module, relative_obj_name = import_module(obj_name)
-    return find_obj_in_module(module, relative_obj_name)
+def _import_obj(obj_name):
+    module, relative_obj_name = _import_module(obj_name)
+    return _find_obj_in_module(module, relative_obj_name)
 
 _autosummary_vars = OrderedDict() # name => [var, ...]
 _autosummary_immediate = OrderedDict() # name => update_op, update_value
