@@ -63,6 +63,7 @@ class PG_GANs():
             tf.set_random_seed(np.random.randint(1 << 31))
             self._session = _create_session(config_dict=tf_config, force_as_default=True)
 
+       
     def train(self, dataset_uri):
         D_repeats = self._knobs.get('D_repeats')
         _train_progressive_gan(dataset_uri=dataset_uri, num_gpus=self.num_gpus, D_repeats=D_repeats)
