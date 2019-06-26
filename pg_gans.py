@@ -8,6 +8,8 @@ import numpy as np
 import tensorflow as tf
 import glob
 import sys
+from io import BytesIO
+import base64
 #import argparse
 #import threading
 from six.moves import urllib
@@ -28,13 +30,13 @@ import scipy.misc
 
 
 from rafiki.model import BaseModel, InvalidModelParamsException, test_model_class, \
-                        IntegerKnob, CategoricalKnob, dataset_utils, logger
+                        IntegerKnob, CategoricalKnob, FloatKnob, FixedKnob, dataset_utils
 from rafiki.constants import TaskType, ModelDependency
 
 #----------------------------------------------------------------------------
 # Implements Progressive Growing of GANs for image generation
 
-class PG_GANs():
+class PG_GANs(BaseModel):
 
     @staticmethod
     def get_knob_config():
@@ -49,30 +51,29 @@ class PG_GANs():
     def __init__(self, **knobs):
         super().__init__(**knobs)
         self._knobs = knobs
-        self.num_gpus = 1
+        self.num_gpus = 2
         np.random.seed(1000)
         print('Initializing TensorFlow...')
 
-        tf_config = {}
-        tf_config['graph_options.place_pruned_graph'] = True
-        tf_config['gpu_options.allow_growth'] = True
+        self.tf_config = {}
+        self.tf_config['graph_options.place_pruned_graph'] = True
+        self.tf_config['gpu_options.allow_growth'] = True
 
         #TODO: any environment var needed?
 
         if tf.get_default_session() is None:
             tf.set_random_seed(np.random.randint(1 << 31))
-            self._session = _create_session(config_dict=tf_config, force_as_default=True)
+            self._session = self._create_session(config_dict=self.tf_config, force_as_default=True)
 
-       
     def train(self, dataset_uri):
         D_repeats = self._knobs.get('D_repeats')
-        _train_progressive_gan(dataset_uri=dataset_uri, num_gpus=self.num_gpus, D_repeats=D_repeats)
+        self._train_progressive_gan(dataset_uri=dataset_uri, num_gpus=self.num_gpus, D_repeats=D_repeats)
 
     def evaluate(self, dataset_uri):
         MODEL_DIR = '/tmp/imagenet'
         DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
         softmax = None
-
+        
         if not os.path.exists(MODEL_DIR):
             os.makedirs(MODEL_DIR)
         filename = DATA_URL.split('/')[-1]
@@ -89,7 +90,13 @@ class PG_GANs():
         with tf.gfile.FastGFile(os.path.join(MODEL_DIR, 'classify_image_graph_def.pb'), 'rb') as f:
             graph_def = tf.GraphDef()
             graph_def.ParseFromString(f.read())
-            _ = tf.import_graph_def(graph_def, name='')
+            #_ = tf.import_graph_def(graph_def, name='')
+            # Import model with a modification in the input tensor to accept arbitrary
+            # batch size.
+            input_tensor = tf.placeholder(tf.float32, shape=[None, None, None, 3],
+                                        name='InputTensor')
+            _ = tf.import_graph_def(graph_def, name='',
+                                    input_map={'ExpandDims:0':input_tensor})
 
         with tf.Session() as sess:
             pool3 = sess.graph.get_tensor_by_name('pool_3:0')
@@ -97,6 +104,10 @@ class PG_GANs():
             for op_idx, op in enumerate(ops):
                 for o in op.outputs:
                     shape = o.get_shape()
+                    #print(o)
+                    #print(shape)
+                    if not isinstance(shape, tuple):
+                        continue
                     shape = [s.value for s in shape]
                     new_shape = []
                     for j, s in enumerate(shape):
@@ -107,7 +118,7 @@ class PG_GANs():
                     try:
                         o._shape = tf.TensorShape(new_shape)
                     except ValueError:
-                        o._shape_val = tf.TensorShape(new_shape)
+                        o._shape_val = tf.TensorShape(new_shape) # EDIT: added for compatibility with tensorflow 1.6.0
 
             w = sess.graph.get_operation_by_name("softmax/logits/MatMul").inputs[1]
             logits = tf.matmul(tf.squeeze(pool3, [1, 2]), w)
@@ -144,7 +155,7 @@ class PG_GANs():
             for i in range(n_batches):
                 inp = inps[(i * bs):min((i + 1) * bs, len(inps))]
                 inp = np.concatenate(inp, 0)
-                pred = sess.run(softmax, {'ExpandDims:0': inp})
+                pred = sess.run(softmax, {'InputTensor:0': inp})
                 preds.append(pred)
             preds = np.concatenate(preds, 0)
             scores = []
@@ -153,8 +164,9 @@ class PG_GANs():
                 kl = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
                 kl = np.mean(np.sum(kl, 1))
                 scores.append(np.exp(kl))
+            #print(type(np.mean(scores)))
             
-            return np.mean(scores)
+            return float(np.mean(scores))
 
     def predict(self, queries):
         random_state = np.random.RandomState(1000)
@@ -190,7 +202,16 @@ class PG_GANs():
             grid = np.rint(grid).clip(0, 255).astype(np.uint8)
             format = 'RGB' if grid.ndim == 3 else 'L'
 
-            list_imgs.append(Image.fromarray(grid, format))
+            #print(type(grid))
+            '''
+            image = Image.fromarray(grid, format)
+            output_buffer = BytesIO()
+            image.save(output_buffer, format='JPEG')
+            byte_data = output_buffer.getvalue()
+            base64_str = base64.b64encode(byte_data)'''
+
+            list_imgs.append(grid.tolist())
+            #list_imgs.append(str(base64_str))
 
         return list_imgs
 
@@ -198,19 +219,23 @@ class PG_GANs():
         self._session.close()
 
     def dump_parameters(self):
-        param = {}
-        param['G'] = pickle.dump(self.G, protocol=pickle.HIGHEST_PROTOCOL)
-        param['D'] = pickle.dump(self.D, protocol=pickle.HIGHEST_PROTOCOL)
-        param['Gs'] = pickle.dump(self.Gs, protocol=pickle.HIGHEST_PROTOCOL)
-        return param
+        params = {}
+
+        params['G'] = pickle.dumps(self.G, protocol=pickle.HIGHEST_PROTOCOL)
+        params['D'] = pickle.dumps(self.D, protocol=pickle.HIGHEST_PROTOCOL)
+        params['Gs'] = pickle.dumps(self.Gs, protocol=pickle.HIGHEST_PROTOCOL)
+        return params
 
     def load_parameters(self, params):
-        self.G = pickle.load(param['G'], encoding='latin1')
-        self.D = pickle.load(param['D'], encoding='latin1')
-        self.Gs = pickle.load(param['Gs'], encoding='latin1')
+        tf.set_random_seed(np.random.randint(1 << 31))
+        self._session = self._create_session(config_dict=self.tf_config, force_as_default=True)
+
+        self.G = pickle.loads(params['G'], encoding='latin1')
+        self.D = pickle.loads(params['D'], encoding='latin1')
+        self.Gs = pickle.loads(params['Gs'], encoding='latin1')
 
     # Creating TensorFlow Session
-    def _create_session(config_dict=dict(), force_as_default=False):
+    def _create_session(self, config_dict=dict(), force_as_default=False):
         config = tf.ConfigProto()
 
         for key, value in config_dict.items():
@@ -229,38 +254,42 @@ class PG_GANs():
 
         return session
 
-    def _load_dataset(data_dir=None, **kwargs):
+    def _load_dataset(self, data_dir=None, **kwargs):
         adjusted_kwargs = dict(kwargs)
         if 'tfrecord_dir' in adjusted_kwargs and data_dir is not None:
-            adjusted_kwargs['tfrecord_dir'] = os.path.join(data_dir, adjusted_kwargs['tfrecord_dir'])
+            #adjusted_kwargs['tfrecord_dir'] = os.path.join(data_dir, adjusted_kwargs['tfrecord_dir'])
+            adjusted_kwargs['tfrecord_dir'] = os.path.expanduser(data_dir)
         dataset = TFRecordDataset(**adjusted_kwargs)
         return dataset
 
     # Main Training Process
-    def _train_progressive_gan(dataset_uri,
+    def _train_progressive_gan(self, dataset_uri,
         num_gpus                = 1,
         G_smoothing             = 0.99,
         D_repeats               = 1,
         minibatch_repeats       = 4,
         reset_opt_for_new_lod   = True,
-        total_kimg              = 12000,
+        total_kimg              = 1,
         mirror_augment          = False,
         drange_net              = [-1, 1]):
 
-        self.training_set = _load_dataset({'tfrecord_dir': './'}, data_dir=dataset_uri)
+        config_dataset = {}
+        config_dataset['tfrecord_dir'] = './'
+        self.training_set = self._load_dataset(dataset_uri, **config_dataset)
         with tf.device('/gpu:0'):
             print('Constructing networks...')
             self.G = Network('G', func='G_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
             self.D = Network('D', func='D_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
             self.Gs = self.G.clone('Gs')
             Gs_update_op = self.Gs.setup_as_moving_average_of(self.G, beta=G_smoothing)
+            #print(Gs_update_op)
 
         print('Building TensorFlow graph...')
         with tf.name_scope('Inputs'):
             lod_in = tf.placeholder(tf.float32, name='lod_in', shape=[])
             lrate_in = tf.placeholder(tf.float32, name='lrate_in', shape=[])
             minibatch_in = tf.placeholder(tf.int32, name='minibatch_in', shape=[])
-            minibatch_split = minibatch_in / num_gpus       # TODO: enter num_gpus
+            minibatch_split = minibatch_in // num_gpus       # TODO: enter num_gpus
             reals, labels = self.training_set.get_minibatch_tf()
             reals_split = tf.split(reals, num_gpus)
             labels_split = tf.split(labels, num_gpus)
@@ -275,13 +304,13 @@ class PG_GANs():
                 G_gpu = self.G if gpu == 0 else self.G.clone(self.G.name + '_shadow')
                 D_gpu = self.D if gpu == 0 else self.D.clone(self.D.name + '_shadow')
                 lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
-                reals_gpu = _process_reals(reals_split[gpu], lod_in, mirror_augment, self.training_set.dynamic_range, drange_net)
+                reals_gpu = self._process_reals(reals_split[gpu], lod_in, mirror_augment, self.training_set.dynamic_range, drange_net)
                 labels_gpu = labels_split[gpu]
                 
                 with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
-                    G_loss = _G_wgan_acgan(G=G_gpu, D=D_gpu, opt=G_opt, training_set=self.training_set, minibatch_size=minibatch_split, **config_G_loss)  # TODO: config_G_loss, config_D_loss
+                    G_loss = _G_wgan_acgan(G=G_gpu, D=D_gpu, opt=G_opt, training_set=self.training_set, minibatch_size=minibatch_split)
                 with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
-                    D_loss = _D_wgangp_acgan(G=G_gpu, D=D_gpu, opt=D_opt, training_set=self.training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config_D_loss)
+                    D_loss = _D_wgangp_acgan(G=G_gpu, D=D_gpu, opt=D_opt, training_set=self.training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu)
                 G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
                 D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
         G_train_op = G_opt.apply_updates()
@@ -296,9 +325,10 @@ class PG_GANs():
         config_sched['G_lrate'] = self._knobs.get('G_lrate')
         config_sched['D_lrate'] = self._knobs.get('D_lrate')
         config_sched['lod_initial_resolution'] = self._knobs.get('lod_initial_resolution')
-
+        _init_uninited_vars()
+        #tf.initialize_local_variables()
         while cur_nimg < total_kimg * 1000:
-            sched = TrainingSchedule(num_gpus, cur_nimg, self.training_set, **config_sched)
+            sched = TrainingSchedule(cur_nimg, self.training_set, num_gpus, **config_sched)
             self.training_set.configure(sched.minibatch, sched.lod)
             if reset_opt_for_new_lod:
                 if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
@@ -310,13 +340,15 @@ class PG_GANs():
                 for _ in range(D_repeats):
                     tf.get_default_session().run([D_train_op, Gs_update_op], {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_in: sched.minibatch})
                     cur_nimg += sched.minibatch
+                    print('-------------------')
                 tf.get_default_session().run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
+                print(111111111111111111) 
 
-    def _process_reals(x, lod, mirror_augment, drange_data, drange_net):
+    def _process_reals(self, x, lod, mirror_augment, drange_data, drange_net):
         with tf.name_scope('ProcessReals'):
             with tf.name_scope('DynamicRange'):
                 x = tf.cast(x, tf.float32)
-                x = _adjust_dynamic_range(x, drange_data, drange_net)
+                x = self._adjust_dynamic_range(x, drange_data, drange_net)
             if mirror_augment:
                 with tf.name_scope('MirrorAugment'):
                     s = tf.shape(x)
@@ -339,7 +371,7 @@ class PG_GANs():
                 x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
             return x
 
-    def _adjust_dynamic_range(data, drange_in, drange_out):
+    def _adjust_dynamic_range(self, data, drange_in, drange_out):
         if drange_in != drange_out:
             scale = (np.float32(drange_out[1]) - np.float32(drange_out[0])) / (np.float32(drange_in[1]) - np.float32(drange_in[0]))
             bias = (np.float32(drange_out[0]) - np.float32(drange_in[0]) * scale)
@@ -379,6 +411,7 @@ class TFRecordDataset:
         self._cur_minibatch = -1
         self._cur_lod = -1
 
+        #print(self.tfrecord_dir)
         assert os.path.isdir(self.tfrecord_dir)
 
         tfr_files = sorted(glob.glob(os.path.join(self.tfrecord_dir, '*.tfrecords')))
@@ -388,7 +421,7 @@ class TFRecordDataset:
         for tfr_file in tfr_files:
             tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
             for record in tf.python_io.tf_record_iterator(tfr_file, tfr_opt):
-                tfr_shapes.append(_parse_tfrecord_np(record).shape)
+                tfr_shapes.append(self._parse_tfrecord_np(record).shape)
                 break
 
         if self.label_file is None:
@@ -431,7 +464,7 @@ class TFRecordDataset:
                 if tfr_lod < 0:
                     continue
                 dset = tf.data.TFRecordDataset(tfr_file, compression_type='', buffer_size=buffer_mb<<20)
-                dset = dset.map(_parse_tfrecord_tf, num_parallel_calls=num_threads)
+                dset = dset.map(self._parse_tfrecord_tf, num_parallel_calls=num_threads)
                 dset = tf.data.Dataset.zip((dset, self._tf_labels_dataset))
                 bytes_per_item = np.prod(tfr_shape) * np.dtype(self.dtype).itemsize
                 if shuffle_mb > 0:
@@ -442,7 +475,7 @@ class TFRecordDataset:
                     dset = dset.prefetch(((prefetch_mb << 20) - 1) // bytes_per_item + 1)
                 dset = dset.batch(self._tf_minibatch_in)
                 self._tf_datasets[tfr_lod] = dset
-            self.tf_record_iterator = tf.data.Iterator.from_structure(self._tf_datasets[0].output_types, self._tf_datasets[0].output_shapes)
+            self._tf_iterator = tf.data.Iterator.from_structure(self._tf_datasets[0].output_types, self._tf_datasets[0].output_shapes)
             self._tf_init_ops = {lod: self._tf_iterator.make_initializer(dset) for lod, dset in self._tf_datasets.items()}
 
     # use the given minibatch size and level-of-detail for the data returned by get_minibatch_tf()
@@ -480,7 +513,7 @@ class TFRecordDataset:
             return np.zeros([minibatch_size, 0], self.label_dtype)
 
     # parse individual image from a tfrecords file as TensorFlow expression
-    def _parse_tfrecord_np(record):
+    def _parse_tfrecord_np(self, record):
         ex = tf.train.Example()
         ex.ParseFromString(record)
         shape = ex.features.feature['shape'].int64_list.value
@@ -488,13 +521,15 @@ class TFRecordDataset:
         return np.fromstring(data, np.uint8).reshape(shape)
 
     # parse individual image from a tfrecords file as NumPy array
-    def _parse_tfrecord_tf(record):
+    def _parse_tfrecord_tf(self, record):
         features = tf.parse_single_example(record, features={
             'shape': tf.FixedLenFeature([3], tf.int64),
             'data': tf.FixedLenFeature([], tf.string)})
         data = tf.decode_raw(features['data'], tf.uint8)
         return tf.reshape(data, features['shape'])
 
+network_import_handlers = []
+_network_import_modules = []
 class Network:
     def __init__(self,
         name=None,
@@ -556,6 +591,8 @@ class Network:
         self.num_outputs = len(self.output_templates)
         assert self.num_outputs >= 1
 
+        #print(self.input_templates[0])
+
         self.input_shapes = [[dim.value for dim in t.shape] for t in self.input_templates]
         self.output_shapes = [[dim.value for dim in t.shape] for t in self.output_templates]
         self.input_shape = self.input_shapes[0]
@@ -564,7 +601,7 @@ class Network:
         self.trainables = OrderedDict([(self.get_var_localname(var), var) for var in tf.trainable_variables(self.scope + '/')])
 
     def reset_vars(self):
-        run([var.initializer for var in self.vars.values()])
+        tf.get_default_session().run([var.initializer for var in self.vars.values()])
 
     def run(self, *in_arrays,
         return_as_list      = False,
@@ -630,7 +667,7 @@ class Network:
                 for name, var in self.vars.items():
                     if name in src_net.vars:
                         cur_beta = beta if name in self.trainables else beta_nontrainable
-                        new_value = _lerp(src_net.vars[name], var, cur_beta)
+                        new_value = Network._lerp(src_net.vars[name], var, cur_beta)
                         ops.append(var.assign(new_value))
                 return tf.group(*ops)
 
@@ -643,6 +680,7 @@ class Network:
         net._build_func = self._build_func
         net._init_graph()
         net.copy_vars_from(self)
+        #print(net.vars)
         return net
 
     def get_var_localname(self, var_or_globalname):
@@ -660,7 +698,7 @@ class Network:
 
         with tf.variable_scope(self.scope, reuse=True):
             assert tf.get_variable_scope().name == self.scope
-            named_inputs = [tf.identify(expr, name=name) for expr, name in zip(in_expr, self.input_names)]
+            named_inputs = [tf.identity(expr, name=name) for expr, name in zip(in_expr, self.input_names)]
             out_expr = self._build_func(*named_inputs, **all_kwargs)
         assert isinstance(out_expr, tf.Tensor) or isinstance(out_expr, tf.Variable) or isinstance(out_expr, tf.Operation) or isinstance(out_expr, tuple)
 
@@ -670,16 +708,42 @@ class Network:
 
     def copy_vars_from(self, src_net):
         assert isinstance(src_net, Network)
-        name_to_value = run({name: src_net.find_var(name) for name in self.trainables.keys()})
+        name_to_value = tf.get_default_session().run({name: src_net.find_var(name) for name in self.trainables.keys()})
         _set_vars({self.find_var(name): value for name, value in name_to_value.items()})
 
     def find_var(self, var_or_localname):
         assert isinstance(var_or_localname, tf.Tensor) or isinstance(var_or_localname, tf.Variable) or isinstance(var_or_localname, tf.Operation) or isinstance(var_or_localname, str)
         return self.vars[var_or_localname] if isinstance(var_or_localname, str) else var_or_localname
 
+    def __getstate__(self):
+        return {
+            'version': 2,
+            'name': self.name,
+            'static_kwargs': self.static_kwargs,
+            'build_func_name': self._build_func_name,
+            'variables': list(zip(self.vars.keys(), tf.get_default_session().run(list(self.vars.values()))))
+        }
+
+    def __setstate__(self, state):
+        self._init_fields()
+
+        for handler in network_import_handlers:
+            state = handler(state)
+
+        assert state['version'] == 2
+        self.name = state['name']
+        self.static_kwargs = state['static_kwargs']
+        self._build_func_name = state['build_func_name']
+
+        self._build_func = getattr(Network, self._build_func_name)
+
+        self._init_graph()
+        self.reset_vars()
+        
+        _set_vars({self.find_var(name): value for name, value in state['variables']})
 
     # Generator network
-    def G_paper(self,
+    def G_paper(
         latents_in,                     # latent vectors [minibatch, latent_size]
         labels_in,                      # labels [minibatch, label_size]
         num_channels        = 1,
@@ -703,11 +767,11 @@ class Network:
         resolution_log2 = int(np.log2(resolution))
         assert resolution == 2**resolution_log2 and resolution >= 4
         def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
-        def PN(x): return _pixel_norm(x, epsilon=pixelnorm_epsilon) if use_pixelnorm else x
+        def PN(x): return Network._pixel_norm(x, epsilon=pixelnorm_epsilon) if use_pixelnorm else x
 
         if latent_size is None: latent_size = nf(0)
         if structure is None: structure = 'linear' if is_template_graph else 'recursive'
-        act = _leaky_relu if use_leakyrelu else tf.nn.relu
+        act = Network._leaky_relu if use_leakyrelu else tf.nn.relu
 
         latents_in.set_shape([None, latent_size])       # TODO: set_shape() ?
         labels_in.set_shape([None, label_size])
@@ -717,58 +781,58 @@ class Network:
         def block(x, res):  # res = 2..resolution_log2
             with tf.variable_scope('%dx%d' % (2**res, 2**res)):
                 if res == 2:    # 4x4
-                    if normalize_latents: x = _pixel_norm(x, epsilon=pixelnorm_epsilon)
+                    if normalize_latents: x = Network._pixel_norm(x, epsilon=pixelnorm_epsilon)
                     with tf.variable_scope('Dense'):
-                        x = _dense(x, fmaps=nf(res-1)*16, gain=np.sqrt(2)/4, use_wscale=use_wscale)
+                        x = Network._dense(x, fmaps=nf(res-1)*16, gain=np.sqrt(2)/4, use_wscale=use_wscale)
                         x = tf.reshape(x, [-1, nf(res-1), 4, 4])
-                        x = PN(act(_apply_bias(x)))
+                        x = PN(act(Network._apply_bias(x)))
                     with tf.variable_scope('Conv'):
-                        x = PN(act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
+                        x = PN(act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
                 else:   # 8x8 and up
                     if fused_scale:
                         with tf.variable_scope('Conv0_up'):
-                            x = PN(act(_apply_bias(_upscale2d_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
+                            x = PN(act(Network._apply_bias(Network._upscale2d_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
                     else:
-                        x = _upscale2d(x)
+                        x = Network._upscale2d(x)
                         with tf.variable_scope('Conv0'):
-                            x = PN(act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
+                            x = PN(act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
                     with tf.variable_scope('Conv1'):
-                        x = PN(act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
+                        x = PN(act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale))))
                 return x
 
         def torgb(x, res):
             lod = resolution_log2 - res
             with tf.variable_scope('ToRGB_lod%d' % lod):
-                return _apply_bias(_conv2d(x, fmaps=num_channels, kernel=1, gain=1, use_wscale=use_wscale))
+                return Network._apply_bias(Network._conv2d(x, fmaps=num_channels, kernel=1, gain=1, use_wscale=use_wscale))
 
         if structure == 'linear':
-            x = block(x, res)
+            x = block(combo_in, 2)
             images_out = torgb(x, 2)
             for res in range(3, resolution_log2 + 1):
                 lod = resolution_log2 - res
                 x = block(x, res)
                 img = torgb(x, res)
-                images_out = _upscale2d(images_out)
+                images_out = Network._upscale2d(images_out)
                 with tf.variable_scope('Grow_lod%d' % lod):
-                    images_out = _lerp_clip(img, images_out, lod_in - lod)
+                    images_out = Network._lerp_clip(img, images_out, lod_in - lod)
 
         if structure == 'recursive':
             def grow(x, res, lod):
                 y = block(x, res)
-                img = lambda: _upscale2d(torgb(y, res), 2**lod)
+                img = lambda: Network._upscale2d(torgb(y, res), 2**lod)
                 if res > 2:
-                    img = _cset(img, (lod_in > lod), lambda: _upscale2d(_lerp(torgb(y, res), _upscale2d(torgb(x, res-1)), lod_in - lod), 2**lod))
+                    img = Network._cset(img, (lod_in > lod), lambda: Network._upscale2d(Network._lerp(torgb(y, res), Network._upscale2d(torgb(x, res-1)), lod_in - lod), 2**lod))
                 if lod > 0:
-                    img = _cset(img, (lod_in < lod), lambda: grow(y, res+1, lod-1))
+                    img = Network._cset(img, (lod_in < lod), lambda: grow(y, res+1, lod-1))
                 return img()
             images_out = grow(combo_in, 2, resolution_log2 - 2)
 
         assert images_out.dtype == tf.as_dtype(dtype)
-        images_out = tf.identify(images_out, name='image_out')
+        images_out = tf.identity(images_out, name='image_out')
         return images_out
 
     # Discriminator network
-    def D_paper(self,
+    def D_paper(
         images_in,
         num_channels        = 1,
         resolution          = 32,
@@ -788,7 +852,7 @@ class Network:
         assert resolution == 2**resolution_log2 and resolution >= 4
         def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
         if structure is None: structure = 'linear' if is_template_graph else 'recursive'
-        act = _leaky_relu
+        act = Network._leaky_relu
 
         images_in.set_shape([None, num_channels, resolution, resolution])
         images_in = tf.cast(images_in, dtype)
@@ -796,29 +860,29 @@ class Network:
 
         def fromrgb(x, res):
             with tf.variable_scope('FromRGB_lod%d' % (resolution_log2 - res)):
-                return act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=1, use_wscale=use_wscale)))
+                return act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=1, use_wscale=use_wscale)))
         
         def block(x, res):
             with tf.variable_scope('%dx%d' % (2**res, 2**res)):
                 if res >= 3:
                     with tf.variable_scope('Conv0'):
-                        x = act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
+                        x = act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
                     if fused_scale:
                         with tf.variable_scope('Conv1_down'):
-                            x = act(_apply_bias(_conv2d_downscale2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
+                            x = act(Network._apply_bias(Network._conv2d_downscale2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
                     else:
                         with tf.variable_scope('Conv1'):
-                            x = act(_apply_bias(_conv2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
-                        x = _downscale2d(x)
+                            x = act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-2), kernel=3, use_wscale=use_wscale)))
+                        x = Network._downscale2d(x)
                 else:
                     if mbstd_group_size > 1:
-                        x = _minibatch_stddev_layer(x, mbstd_group_size)
+                        x = Network._minibatch_stddev_layer(x, mbstd_group_size)
                     with tf.variable_scope('Conv'):
-                        x = act(_apply_bias(_conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
+                        x = act(Network._apply_bias(Network._conv2d(x, fmaps=nf(res-1), kernel=3, use_wscale=use_wscale)))
                     with tf.variable_scope('Dense0'):
-                        x = act(_apply_bias(_dense(x, fmaps=nf(res-2), use_wscale=use_wscale)))
+                        x = act(Network._apply_bias(Network._dense(x, fmaps=nf(res-2), use_wscale=use_wscale)))
                     with tf.variable_scope('Dense1'):
-                        x = _apply_bias(_dense(x, fmaps=1+label_size, gain=1, use_wscale=use_wscale))
+                        x = Network._apply_bias(Network._dense(x, fmaps=1+label_size, gain=1, use_wscale=use_wscale))
                 return x
 
         if structure == 'linear':
@@ -827,50 +891,50 @@ class Network:
             for res in range(resolution_log2, 2, -1):
                 lod = resolution_log2 - res
                 x = block(x, res)
-                img = _downscale2d(img)
+                img = Network._downscale2d(img)
                 y = fromrgb(img, res - 1)
                 with tf.variable_scope('Grow_lod%d' % lod):
-                    x = _lerp_clip(x, y, lod_in - lod)
+                    x = Network._lerp_clip(x, y, lod_in - lod)
             combo_out = block(x, 2)
 
         if structure == 'recursive':
             def grow(res, lod):
-                x = lambda: fromrgb(_downscale2d(images_in, 2**lod), res)
+                x = lambda: fromrgb(Network._downscale2d(images_in, 2**lod), res)
                 if lod > 0:
-                    x = _cset(x, (lod_in < lod), lambda: grow(res+1, lod-1))
-                x = block(x(), res); y = lambda: X
+                    x = Network._cset(x, (lod_in < lod), lambda: grow(res+1, lod-1))
+                x = block(x(), res); y = lambda: x
                 if res > 2:
-                    y = _cset(y, (lod_in > lod), lambda: _lerp(x, fromrgb(_downscale2d(images_in, 2**(lod+1)), res - 1), lod_in - lod))
+                    y = Network._cset(y, (lod_in > lod), lambda: Network._lerp(x, fromrgb(Network._downscale2d(images_in, 2**(lod+1)), res - 1), lod_in - lod))
                 return y()
             combo_out = grow(2, resolution_log2 - 2)
         
         assert combo_out.dtype == tf.as_dtype(dtype)
-        scores_out = tf.identify(combo_out[:, :1], name='scores_out')
-        labels_out = tf.identify(combo_out[:, 1:], name='labels_out')
+        scores_out = tf.identity(combo_out[:, :1], name='scores_out')
+        labels_out = tf.identity(combo_out[:, 1:], name='labels_out')
         return scores_out, labels_out
 
 
     # same as tf.nn.leaky_relu, but supports FP16
-    def _leaky_relu(self, x, alpha=0.2):
+    def _leaky_relu(x, alpha=0.2):
         with tf.name_scope('LeakyRelu'):
             alpha = tf.constant(alpha, dtype=x.dtype, name='alpha')
             return tf.maximum(x * alpha, x)
 
     # pixelwise feature vector normalization
-    def _pixel_norm(self, x, epsilon=1e-8):
+    def _pixel_norm(x, epsilon=1e-8):
         with tf.variable_scope('PixelNorm'):
             return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
 
     # fully connected layer
-    def _dense(self, x, fmaps, gain=np.sqrt(2), use_wscale=False):
+    def _dense(x, fmaps, gain=np.sqrt(2), use_wscale=False):
         if len(x.shape) > 2:
             x = tf.reshape(x, [-1, np.prod([d.value for d in x.shape[1:]])])
-        w = _get_weight([x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
+        w = Network._get_weight([x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
         w = tf.cast(w, x.dtype)
         return tf.matmul(x, w)
 
     # get/create weight tensor for a convolutional/fully-connected layer
-    def _get_weight(self, shape, gain=np.sqrt(2), use_wscale=False, fan_in=None):
+    def _get_weight(shape, gain=np.sqrt(2), use_wscale=False, fan_in=None):
         if fan_in is None: fan_in = np.prod(shape[:-1])
         std = gain / np.sqrt(fan_in)
         if use_wscale:
@@ -880,7 +944,7 @@ class Network:
             return tf.get_variable('weight', shape=shape, initializer=tf.initializers.random_normal(0, std))
 
     # apply bias to activation tensor
-    def _apply_bias(self, x):
+    def _apply_bias(x):
         b = tf.get_variable('bias', shape=[x.shape[1]], initializer=tf.initializers.zeros())
         b = tf.cast(b, x.dtype)
         if len(x.shape) == 2:
@@ -889,16 +953,16 @@ class Network:
             return x + tf.reshape(b, [1, -1, 1, 1])
 
     # convolutional layer
-    def _conv2d(self, x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
+    def _conv2d(x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
         assert kernel >=1 and kernel % 2 == 1
-        w = _get_weight([kernel, kernel, x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
+        w = Network._get_weight([kernel, kernel, x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
         w = tf.cast(w, x.dtype)
         return tf.nn.conv2d(x, w, strides=[1, 1, 1, 1], padding='SAME', data_format='NCHW')
 
     # Fused upscale2d + conv2d
-    def _upscale2d_conv2d(self, x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
+    def _upscale2d_conv2d(x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
         assert kernel >= 1 and kernel % 2 == 1
-        w = _get_weight([kernel, kernel, fmaps, x.shape[1].value], gain=gain, use_wscale=use_wscale, fan_in=(kernel**2)*x.shape[1].value)
+        w = Network._get_weight([kernel, kernel, fmaps, x.shape[1].value], gain=gain, use_wscale=use_wscale, fan_in=(kernel**2)*x.shape[1].value)
         w = tf.pad(w, [[1,1], [1,1], [0,0], [0,0]], mode='CONSTANT')
         w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]])
         w = tf.cast(w, x.dtype)
@@ -906,7 +970,7 @@ class Network:
         return tf.nn.conv2d_transpose(x, w, os, strides=[1,1,2,2], padding='SAME', data_format='NCHW')
 
     # nearest-neighbor upscaling layer
-    def _upscale2d(self, x, factor=2):
+    def _upscale2d(x, factor=2):
         assert isinstance(factor, int) and factor >= 1
         if factor == 1: return x
         with tf.variable_scope('Upscale2D'):
@@ -917,16 +981,16 @@ class Network:
             return x
 
     # Fused conv2d + downscale2d
-    def _conv2d_downscale2d(self, x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
+    def _conv2d_downscale2d(x, fmaps, kernel, gain=np.sqrt(2), use_wscale=False):
         assert kernel >= 1 and kernel % 2 == 1
-        w = _get_weight([kernel, kernel, x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
+        w = Network._get_weight([kernel, kernel, x.shape[1].value, fmaps], gain=gain, use_wscale=use_wscale)
         w = tf.pad(w, [[1,1], [1,1], [0,0], [0,0]], mode='CONSTANT')
         w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]]) * 0.25
         w = tf.cast(w, x.dtype)
         return tf.nn.conv2d(x, w, strides=[1,1,2,2], padding='SAME', data_format='NCHW')
 
     # box filter downscaling layer
-    def _downscale2d(self, x, factor=2):
+    def _downscale2d(x, factor=2):
         assert isinstance(factor, int) and factor >= 1
         if factor == 1: return x
         with tf.variable_scope('Downscale2D'):
@@ -934,7 +998,7 @@ class Network:
             return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')   # NOTE: requires tf_config['graph_options.place_pruned_graph'] = True
 
     # minibatch standard deviation
-    def _minibatch_stddev_layer(self, x, group_size=4):
+    def _minibatch_stddev_layer(x, group_size=4):
         with tf.variable_scope('MinibatchStddev'):
             group_size = tf.minimum(group_size, tf.shape(x)[0])
             s = x.shape
@@ -948,13 +1012,13 @@ class Network:
             y = tf.tile(y, [group_size, 1, s[2], s[3]])
             return tf.concat([x, y], axis=1)
 
-    def _lerp_clip(self, a, b, t):
+    def _lerp_clip(a, b, t):
         return a + (b - a) * tf.clip_by_value(t, 0.0, 1.0)
 
-    def _cset(self, cur_lambda, new_cond, new_lambda):
+    def _cset(cur_lambda, new_cond, new_lambda):
         return lambda: tf.cond(new_cond, new_lambda, cur_lambda)
 
-    def _lerp(self, a, b, t):
+    def _lerp(a, b, t):
         return a + (b - a) * t
 
 class Optimizer:
@@ -1224,16 +1288,16 @@ def _init_uninited_vars(vars=None):
     test_vars = []; test_ops = []
     with tf.control_dependencies(None): # ignore surrounding control_dependencies
         for var in vars:
-            assert is_tf_expression(var)
+            assert isinstance(var, tf.Tensor) or isinstance(var, tf.Variable) or isinstance(var, tf.Operation)
             try:
                 tf.get_default_graph().get_tensor_by_name(var.name.replace(':0', '/IsVariableInitialized:0'))
             except KeyError:
                 # Op does not exist => variable may be uninitialized.
                 test_vars.append(var)
-                with absolute_name_scope(var.name.split(':')[0]):
+                with tf.name_scope(var.name.split(':')[0] + '/'):
                     test_ops.append(tf.is_variable_initialized(var))
-    init_vars = [var for var, inited in zip(test_vars, run(test_ops)) if not inited]
-    run([var.initializer for var in init_vars])
+    init_vars = [var for var, inited in zip(test_vars, tf.get_default_session().run(test_ops)) if not inited]
+    tf.get_default_session().run([var.initializer for var in init_vars])
 
 def _import_module(module_or_obj_name):
     parts = module_or_obj_name.split('.')
