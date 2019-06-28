@@ -10,27 +10,22 @@ import glob
 import sys
 from io import BytesIO
 import base64
-#import argparse
-#import threading
+import argparse
+import threading
 from six.moves import urllib
-#import traceback
+import six.moves.queue as Queue
+import traceback
 from PIL import Image
 import inspect
 import importlib
-#import imp
 from collections import OrderedDict
 import tarfile
 import math
-#import re
-#import datetime
-#import time
-#import bisect
-#import scipy.ndimage
 import scipy.misc
 
 
 from rafiki.model import BaseModel, InvalidModelParamsException, test_model_class, \
-                        IntegerKnob, CategoricalKnob, FloatKnob, FixedKnob, dataset_utils
+                        IntegerKnob, CategoricalKnob, FloatKnob, FixedKnob, dataset_utils, logger
 from rafiki.constants import TaskType, ModelDependency
 
 #----------------------------------------------------------------------------
@@ -43,15 +38,15 @@ class PG_GANs(BaseModel):
         return {
             'D_repeats': IntegerKnob(1, 3),
             'minibatch_base': CategoricalKnob([4, 8, 16, 32]),
-            'G_lrate': FloatKnob(1e-5, 1e-1, is_exp=True),
-            'D_lrate': FloatKnob(1e-5, 1e-1, is_exp=True),
+            'G_lrate': FloatKnob(1e-3, 3e-3, is_exp=False),
+            'D_lrate': FloatKnob(1e-3, 3e-3, is_exp=False),
             'lod_initial_resolution': FixedKnob(4)
         }
 
     def __init__(self, **knobs):
         super().__init__(**knobs)
         self._knobs = knobs
-        self.num_gpus = 2
+        self.num_gpus = len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
         np.random.seed(1000)
         print('Initializing TensorFlow...')
 
@@ -174,7 +169,7 @@ class PG_GANs(BaseModel):
         num_images = queries[2]
         list_imgs = []
         for idx in range(num_images):
-            print('Generating image %d / %d' % (idx, num_images))
+            print('Generating image %d / %d' % (idx+1, num_images))
             latents = random_state.randn(np.prod(grid_size), *self.Gs.input_shape[1:]).astype(np.float32)
             labels = np.zeros([latents.shape[0], 0], np.float32)
             images = self.Gs.run(latents, labels, minibatch_size=8, num_gpus=self.num_gpus, out_mul=127.5, out_add=127.5, out_shrink=1, out_dtype=np.uint8)
@@ -187,10 +182,10 @@ class PG_GANs(BaseModel):
 
             grid = np.zeros(list(images.shape[1:-2]) + [grid_h * img_h, grid_w * img_w], dtype=images.dtype)
 
-            for idx in range(num):
-                x = (idx % grid_w) * img_w
-                y = (idx // grid_w) * img_h
-                grid[..., y : y + img_h, x : x + img_w] = images[idx]
+            for i in range(num):
+                x = (i % grid_w) * img_w
+                y = (i // grid_w) * img_h
+                grid[..., y : y + img_h, x : x + img_w] = images[i]
             
             assert grid.ndim == 2 or grid.ndim == 3
             if grid.ndim == 3:
@@ -203,14 +198,17 @@ class PG_GANs(BaseModel):
             format = 'RGB' if grid.ndim == 3 else 'L'
 
             #print(type(grid))
-            '''
+            
             image = Image.fromarray(grid, format)
-            output_buffer = BytesIO()
+            image.save('output%d.jpeg' % idx, 'JPEG')
+            print('output%d.jpeg is saved' % idx)
+            '''output_buffer = BytesIO()
             image.save(output_buffer, format='JPEG')
             byte_data = output_buffer.getvalue()
             base64_str = base64.b64encode(byte_data)'''
 
-            list_imgs.append(grid.tolist())
+            list_imgs.append(os.path.abspath('output%d.jpeg' % idx))
+            #list_imgs.append(grid.tolist())
             #list_imgs.append(str(base64_str))
 
         return list_imgs
@@ -229,7 +227,6 @@ class PG_GANs(BaseModel):
     def load_parameters(self, params):
         tf.set_random_seed(np.random.randint(1 << 31))
         self._session = self._create_session(config_dict=self.tf_config, force_as_default=True)
-
         self.G = pickle.loads(params['G'], encoding='latin1')
         self.D = pickle.loads(params['D'], encoding='latin1')
         self.Gs = pickle.loads(params['Gs'], encoding='latin1')
@@ -254,11 +251,11 @@ class PG_GANs(BaseModel):
 
         return session
 
-    def _load_dataset(self, data_dir=None, **kwargs):
+    def _load_dataset(self, **kwargs):
         adjusted_kwargs = dict(kwargs)
-        if 'tfrecord_dir' in adjusted_kwargs and data_dir is not None:
+        #if 'tfrecord_dir' in adjusted_kwargs and data_dir is not None:
             #adjusted_kwargs['tfrecord_dir'] = os.path.join(data_dir, adjusted_kwargs['tfrecord_dir'])
-            adjusted_kwargs['tfrecord_dir'] = os.path.expanduser(data_dir)
+            #adjusted_kwargs['tfrecord_dir'] = os.path.expanduser(data_dir)
         dataset = TFRecordDataset(**adjusted_kwargs)
         return dataset
 
@@ -269,22 +266,23 @@ class PG_GANs(BaseModel):
         D_repeats               = 1,
         minibatch_repeats       = 4,
         reset_opt_for_new_lod   = True,
-        total_kimg              = 1,
+        total_kimg              = 2,
         mirror_augment          = False,
         drange_net              = [-1, 1]):
 
         config_dataset = {}
-        config_dataset['tfrecord_dir'] = './'
-        self.training_set = self._load_dataset(dataset_uri, **config_dataset)
+        config_dataset['tfrecord_dir'] = os.path.expanduser(dataset_uri)
+        self.training_set = self._load_dataset(**config_dataset)
         with tf.device('/gpu:0'):
             print('Constructing networks...')
             self.G = Network('G', func='G_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
             self.D = Network('D', func='D_paper', num_channels=self.training_set.shape[0], resolution=self.training_set.shape[1], label_size=self.training_set.label_size)
             self.Gs = self.G.clone('Gs')
+            #print(self.G.vars)
             Gs_update_op = self.Gs.setup_as_moving_average_of(self.G, beta=G_smoothing)
             #print(Gs_update_op)
 
-        print('Building TensorFlow graph...')
+        logger.log('Building TensorFlow graph...')
         with tf.name_scope('Inputs'):
             lod_in = tf.placeholder(tf.float32, name='lod_in', shape=[])
             lrate_in = tf.placeholder(tf.float32, name='lrate_in', shape=[])
@@ -316,7 +314,7 @@ class PG_GANs(BaseModel):
         G_train_op = G_opt.apply_updates()
         D_train_op = D_opt.apply_updates()
 
-        print('Training...')
+        logger.log('Training..., it might take a few days...')
 
         cur_nimg = 0
         prev_lod = -1
@@ -325,8 +323,8 @@ class PG_GANs(BaseModel):
         config_sched['G_lrate'] = self._knobs.get('G_lrate')
         config_sched['D_lrate'] = self._knobs.get('D_lrate')
         config_sched['lod_initial_resolution'] = self._knobs.get('lod_initial_resolution')
-        _init_uninited_vars()
-        #tf.initialize_local_variables()
+
+        n = 0
         while cur_nimg < total_kimg * 1000:
             sched = TrainingSchedule(cur_nimg, self.training_set, num_gpus, **config_sched)
             self.training_set.configure(sched.minibatch, sched.lod)
@@ -335,14 +333,14 @@ class PG_GANs(BaseModel):
                     G_opt.reset_optimizer_state()
                     D_opt.reset_optimizer_state()
             prev_lod = sched.lod
+            print('Tick %d' % n)
 
             for repeat in range(minibatch_repeats):
                 for _ in range(D_repeats):
                     tf.get_default_session().run([D_train_op, Gs_update_op], {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_in: sched.minibatch})
                     cur_nimg += sched.minibatch
-                    print('-------------------')
                 tf.get_default_session().run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
-                print(111111111111111111) 
+            n += 1
 
     def _process_reals(self, x, lod, mirror_augment, drange_data, drange_net):
         with tf.name_scope('ProcessReals'):
@@ -528,6 +526,76 @@ class TFRecordDataset:
         data = tf.decode_raw(features['data'], tf.uint8)
         return tf.reshape(data, features['shape'])
 
+class TFRecordExporter:
+    def __init__(self, tfrecord_dir, expected_images, print_progress=True, progress_interval=10):
+        self.tfrecord_dir       = tfrecord_dir
+        self.tfr_prefix         = os.path.join(self.tfrecord_dir, os.path.basename(self.tfrecord_dir))
+        self.expected_images    = expected_images
+        self.cur_images         = 0
+        self.shape              = None
+        self.resolution_log2    = None
+        self.tfr_writers        = []
+        self.print_progress     = print_progress
+        self.progress_interval  = progress_interval
+        if self.print_progress:
+            print('Creating dataset "%s"' % tfrecord_dir)
+        if not os.path.isdir(self.tfrecord_dir):
+            os.makedirs(self.tfrecord_dir)
+        assert(os.path.isdir(self.tfrecord_dir))
+        
+    def close(self):
+        if self.print_progress:
+            print('%-40s\r' % 'Flushing data...', end='', flush=True)
+        for tfr_writer in self.tfr_writers:
+            tfr_writer.close()
+        self.tfr_writers = []
+        if self.print_progress:
+            print('%-40s\r' % '', end='', flush=True)
+            print('Added %d images.' % self.cur_images)
+
+    def choose_shuffled_order(self): # Note: Images and labels must be added in shuffled order.
+        order = np.arange(self.expected_images)
+        np.random.RandomState(123).shuffle(order)
+        return order
+
+    def add_image(self, img):
+        if self.print_progress and self.cur_images % self.progress_interval == 0:
+            print('%d / %d\r' % (self.cur_images, self.expected_images), end='', flush=True)
+        if self.shape is None:
+            self.shape = img.shape
+            self.resolution_log2 = int(np.log2(self.shape[1]))
+            assert self.shape[0] in [1, 3]
+            assert self.shape[1] == self.shape[2]
+            assert self.shape[1] == 2**self.resolution_log2
+            tfr_opt = tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.NONE)
+            for lod in range(self.resolution_log2 - 1):
+                tfr_file = self.tfr_prefix + '-r%02d.tfrecords' % (self.resolution_log2 - lod)
+                self.tfr_writers.append(tf.python_io.TFRecordWriter(tfr_file, tfr_opt))
+        assert img.shape == self.shape
+        for lod, tfr_writer in enumerate(self.tfr_writers):
+            if lod:
+                img = img.astype(np.float32)
+                img = (img[:, 0::2, 0::2] + img[:, 0::2, 1::2] + img[:, 1::2, 0::2] + img[:, 1::2, 1::2]) * 0.25
+            quant = np.rint(img).clip(0, 255).astype(np.uint8)
+            ex = tf.train.Example(features=tf.train.Features(feature={
+                'shape': tf.train.Feature(int64_list=tf.train.Int64List(value=quant.shape)),
+                'data': tf.train.Feature(bytes_list=tf.train.BytesList(value=[quant.tostring()]))}))
+            tfr_writer.write(ex.SerializeToString())
+        self.cur_images += 1
+
+    def add_labels(self, labels):
+        if self.print_progress:
+            print('%-40s\r' % 'Saving labels...', end='', flush=True)
+        assert labels.shape[0] == self.cur_images
+        with open(self.tfr_prefix + '-rxx.labels', 'wb') as f:
+            np.save(f, labels.astype(np.float32))
+            
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
 network_import_handlers = []
 _network_import_modules = []
 class Network:
@@ -678,6 +746,7 @@ class Network:
         net.static_kwargs = dict(self.static_kwargs)
         net._build_func_name = self._build_func_name
         net._build_func = self._build_func
+        #print(net._build_func)
         net._init_graph()
         net.copy_vars_from(self)
         #print(net.vars)
@@ -708,7 +777,7 @@ class Network:
 
     def copy_vars_from(self, src_net):
         assert isinstance(src_net, Network)
-        name_to_value = tf.get_default_session().run({name: src_net.find_var(name) for name in self.trainables.keys()})
+        name_to_value = tf.get_default_session().run({name: src_net.find_var(name) for name in self.vars.keys()})
         _set_vars({self.find_var(name): value for name, value in name_to_value.items()})
 
     def find_var(self, var_or_localname):
@@ -1369,8 +1438,8 @@ if __name__ == '__main__':
         dependencies={
             ModelDependency.TENSORFLOW: '1.12.0'
         },
-        train_dataset_uri='~/progressive_growing_of_gans/tfrecord_4',
-        test_dataset_uri='~/progressive_growing_of_gans/tfrecord_4',
+        train_dataset_uri='data/mnist_for_image_generation',
+        test_dataset_uri='data/mnist_for_image_generation',
         queries=[2, 2, 5]
         
     )
